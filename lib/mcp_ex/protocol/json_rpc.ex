@@ -100,6 +100,29 @@ defmodule MCPEx.Protocol.JsonRpc do
 
     Jason.encode!(response)
   end
+  
+  @doc """
+  Encodes a JSON-RPC error response with code and message.
+
+  ## Parameters
+
+  * `id` - The request ID
+  * `code` - The error code
+  * `message` - The error message
+
+  ## Returns
+
+  * `String.t()` - The encoded JSON-RPC error response
+  """
+  @spec encode_error_response(integer() | String.t(), integer(), String.t()) :: String.t()
+  def encode_error_response(id, code, message) do
+    error = %{
+      code: code,
+      message: message
+    }
+    
+    encode_error(id, error)
+  end
 
   @doc """
   Decodes a JSON-RPC message.

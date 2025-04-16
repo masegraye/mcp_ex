@@ -47,6 +47,7 @@ defmodule MCPEx.Client do
 
   alias MCPEx.Protocol.JsonRpc
   alias MCPEx.Transport
+  alias MCPEx.Sampling
 
   @typedoc "Client options for initialization"
   @type options :: [
@@ -55,7 +56,8 @@ defmodule MCPEx.Client do
           url: String.t() | nil,
           capabilities: [atom()],
           client_info: map(),
-          shell_type: :none | :interactive | :login | :plain
+          shell_type: :none | :interactive | :login | :plain,
+          sampling_handler: module() | {module(), term()}
         ]
 
   @typedoc "Client state"
@@ -372,12 +374,33 @@ defmodule MCPEx.Client do
 
   # GenServer callbacks
 
+  @doc """
+  Registers a sampling handler for the client.
+  
+  ## Parameters
+  
+  * `client` - The client PID
+  * `handler` - The handler module or {module, config} tuple
+  
+  ## Returns
+  
+  * `:ok` - Handler registered successfully
+  * `{:error, reason}` - Failed to register handler
+  """
+  @spec register_sampling_handler(t(), module() | {module(), term()}) :: :ok | {:error, term()}
+  def register_sampling_handler(client, handler) do
+    GenServer.call(client, {:register_sampling_handler, handler})
+  end
+  
   @impl true
   def init(options) do
     transport_type = Keyword.fetch!(options, :transport)
     capabilities = Keyword.get(options, :capabilities, [])
     client_info = Keyword.get(options, :client_info, %{name: "MCPEx", version: "0.1.0"})
     transport_options = Keyword.get(options, :transport_options, [])
+    
+    # Get sampling handler if provided
+    sampling_handler = Keyword.get(options, :sampling_handler)
     
     # Shell type controls whether to run in user's shell environment
     # and which type of shell to use (interactive, login, plain or none)
@@ -498,13 +521,21 @@ defmodule MCPEx.Client do
          pending_requests: %{},
          subscriptions: %{},
          server_capabilities: server_capabilities,
-         server_info: server_info_data
+         server_info: server_info_data,
+         sampling_handler: sampling_handler || Sampling.default_handler()
        }}
     else
       {:error, reason} -> {:stop, reason}
     end
   end
 
+  @impl true
+  def handle_call({:register_sampling_handler, handler}, _from, state) do
+    # Update the state with the new handler
+    updated_state = %{state | sampling_handler: handler}
+    {:reply, :ok, updated_state}
+  end
+  
   @impl true
   def handle_call(:get_server_capabilities, _from, state) do
     if Map.has_key?(state, :server_capabilities) do
@@ -767,6 +798,38 @@ defmodule MCPEx.Client do
     end
   end
 
+  # Handler for sampling/createMessage requests
+  defp handle_method(method, id, params, state) when method == "sampling/createMessage" do
+    # Process the sampling request using our handler
+    case Sampling.process_request(state.sampling_handler, id, params) do
+      {:ok, result} ->
+        # Success response
+        response = JsonRpc.encode_response(id, result)
+        case send_request(state.transport, response) do
+          :ok -> {:ok, state}
+          error -> error # Pass through any errors
+        end
+        
+      {:error, error} ->
+        # Error response
+        response = JsonRpc.encode_error_response(id, error.code, error.message)
+        case send_request(state.transport, response) do
+          :ok -> {:ok, state}
+          error_result -> error_result # Pass through any errors
+        end
+    end
+  end
+  
+  # Default handler for unknown methods
+  defp handle_method(method, id, _params, state) do
+    # Respond with method not found error
+    response = JsonRpc.encode_error_response(id, -32601, "Method not found: #{method}")
+    case send_request(state.transport, response) do
+      :ok -> {:ok, state}
+      error -> error # Pass through any errors
+    end
+  end
+
   # GenServer callback for handling responses from the transport
   @impl true
   def handle_info({:transport_response, response}, state) do
@@ -791,7 +854,25 @@ defmodule MCPEx.Client do
     
     # Log the response for debugging
     Logger.debug("Processed transport response: #{inspect(processed_response)}")
-      
+    
+    # Check if this is a JSON-RPC method request
+    case processed_response do
+      %{"jsonrpc" => "2.0", "method" => method, "id" => id, "params" => params} ->
+        # This is a method request (server calling a client method)
+        case handle_method(method, id, params, state) do
+          {:ok, updated_state} -> {:noreply, updated_state}
+          {:error, _reason} -> {:noreply, state}  # Keep state on error
+        end
+        
+      # Continue with regular response handling
+      _ ->
+        # Handle regular response processing
+        handle_response(processed_response, state)
+    end
+  end
+  
+  # Handle regular JSON-RPC responses
+  defp handle_response(processed_response, state) do
     # Handle complete JSON-RPC responses for TestServer
     case processed_response do
       # Handle complete JSON-RPC responses with result
