@@ -23,7 +23,7 @@ end
 * Tool invocation support
 * Prompt template handling
 * Shell environment integration
-* Support for advertising sampling and routes capabilities (note: handlers for these capabilities are not yet implemented)
+* Support for advertising sampling and roots capabilities (note: handlers for these capabilities are not yet implemented)
 
 ## Usage
 
