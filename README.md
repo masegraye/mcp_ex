@@ -23,6 +23,7 @@ end
 * Tool invocation support
 * Prompt template handling
 * Shell environment integration
+* Support for advertising sampling and routes capabilities (note: handlers for these capabilities are not yet implemented)
 
 ## Usage
 
@@ -31,14 +32,14 @@ end
 {:ok, client} = MCPEx.Client.start_link(
   transport: :stdio,
   command: "/path/to/server",
-  capabilities: [:sampling, :roots]
+  capabilities: []
 )
 
 # Or with HTTP transport
 {:ok, client} = MCPEx.Client.start_link(
   transport: :http,
   url: "https://example.com/mcp",
-  capabilities: [:sampling, :roots]
+  capabilities: []
 )
 
 # List available resources
