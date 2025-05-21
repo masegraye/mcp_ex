@@ -44,6 +44,7 @@ defmodule MCPEx.Client do
 
   use GenServer
   require Logger
+  import Bitwise
 
   alias MCPEx.Protocol.JsonRpc
   alias MCPEx.Transport
@@ -406,6 +407,46 @@ defmodule MCPEx.Client do
     # and which type of shell to use (interactive, login, plain or none)
     shell_type = Keyword.get(options, :shell_type, :none)
     
+    # Get path to the io_wrapper script
+    wrapper_path = try do
+      # Use OTP application priv directory - the proper way to access non-code files
+      wrapper = Application.app_dir(:mcp_ex, "priv/scripts/io_wrapper.sh")
+      
+      # Check if file exists and is executable
+      if File.exists?(wrapper) do
+        case File.stat(wrapper) do
+          {:ok, %{mode: mode}} ->
+            if (mode &&& 0o111) != 0 do
+              # File exists and is executable
+              wrapper
+            else
+              # File exists but is not executable
+              Logger.warning("IO wrapper exists but is not executable: #{wrapper}")
+              nil
+            end
+          _ -> 
+            Logger.warning("Could not stat IO wrapper: #{wrapper}")
+            nil
+        end
+      else
+        Logger.warning("IO wrapper script not found: #{wrapper}")
+        nil
+      end
+    rescue
+      e -> 
+        Logger.warning("Error locating io_wrapper.sh: #{inspect(e)}")
+        nil
+    end
+    
+    # Create stderr log file and store its path
+    stderr_log_path = if wrapper_path do
+      path = Path.join(System.tmp_dir(), "mcp_stderr_#{:erlang.system_time()}.log")
+      Process.put(:stderr_log_path, path)
+      path
+    else
+      nil
+    end
+    
     # Handle different transport options
     {transport_to_use, needs_create} =
       case transport_type do
@@ -416,6 +457,9 @@ defmodule MCPEx.Client do
           # Need to create stdio transport with args if provided
           command = Keyword.fetch!(options, :command)
           args = if Keyword.has_key?(options, :args), do: Keyword.get(options, :args), else: []
+          
+          # Use the wrapper script if available and we're using stdio
+          use_wrapper = wrapper_path != nil && stderr_log_path != nil
           
           # Check if we should enhance with shell environment and if CommandUtils is available
           if shell_type != :none && Code.ensure_loaded?(MCPEx.Utils.CommandUtils) do
@@ -450,33 +494,89 @@ defmodule MCPEx.Client do
               full_command = "#{command_with_path} #{Enum.join(args, " ")}"
               Logger.debug("Using #{shell_type} shell (#{shell_path}): #{Enum.join(shell_args, " ")} \"#{full_command}\"")
               
-              # Build options with shell as the command and full_command in the args
-              shell_stdio_options = Keyword.merge(
-                [
-                  command: shell_path,
-                  args: shell_args ++ [full_command],
-                  env: env,
-                  use_shell_env: true,
-                  needs_shell_delay: needs_delay
-                ], 
-                transport_options
-              )
-              
-              {shell_stdio_options, true}
+              if use_wrapper do
+                # Use wrapper script around the shell command to capture stderr
+                Logger.debug("Using IO wrapper script: #{wrapper_path}")
+                
+                # Build options with wrapper wrapping the shell invocation
+                wrapper_stdio_options = Keyword.merge(
+                  [
+                    command: wrapper_path,
+                    args: [shell_path] ++ shell_args ++ [full_command],
+                    env: env ++ [{"MCP_STDERR_LOG", stderr_log_path}],
+                    use_shell_env: true,
+                    needs_shell_delay: needs_delay,
+                    use_wrapper: false # Already using our wrapper
+                  ], 
+                  transport_options
+                )
+                
+                {wrapper_stdio_options, true}
+              else
+                # Standard shell execution without wrapper
+                shell_stdio_options = Keyword.merge(
+                  [
+                    command: shell_path,
+                    args: shell_args ++ [full_command],
+                    env: env,
+                    use_shell_env: true,
+                    needs_shell_delay: needs_delay
+                  ], 
+                  transport_options
+                )
+                
+                {shell_stdio_options, true}
+              end
             else
               # Use direct approach with command path enhancement
               enhanced_options = transport_options
                 |> Keyword.put(:command_with_path, command_with_path)
                 |> Keyword.put(:env, env)
                 
-              # Create final options with original command (for fallback) and args
-              stdio_options = Keyword.merge([command: command, args: args], enhanced_options)
-              {stdio_options, true}
+              if use_wrapper do
+                # Use wrapper script with the direct command
+                Logger.debug("Using IO wrapper script: #{wrapper_path}")
+                
+                # Create options with wrapper as command
+                wrapper_stdio_options = Keyword.merge(
+                  [
+                    command: wrapper_path,
+                    args: [command] ++ args,
+                    env: enhanced_options[:env] || [] ++ [{"MCP_STDERR_LOG", stderr_log_path}],
+                    use_wrapper: false # Already using our wrapper
+                  ], 
+                  transport_options
+                )
+                
+                {wrapper_stdio_options, true}
+              else
+                # Create final options with original command (for fallback) and args
+                stdio_options = Keyword.merge([command: command, args: args], enhanced_options)
+                {stdio_options, true}
+              end
             end
           else
             # Standard approach without CommandUtils or shell enhancement
-            stdio_options = Keyword.merge([command: command, args: args], transport_options)
-            {stdio_options, true}
+            if use_wrapper do
+              # Use wrapper script with standard command
+              Logger.debug("Using IO wrapper script: #{wrapper_path}")
+              
+              wrapper_stdio_options = Keyword.merge(
+                [
+                  command: wrapper_path,
+                  args: [command] ++ args,
+                  env: [{"MCP_STDERR_LOG", stderr_log_path}],
+                  use_wrapper: false # Already using our wrapper
+                ], 
+                transport_options
+              )
+              
+              {wrapper_stdio_options, true}
+            else
+              # Standard options without wrapper
+              stdio_options = Keyword.merge([command: command, args: args], transport_options)
+              {stdio_options, true}
+            end
           end
         :http ->
           # Need to create http transport
@@ -493,37 +593,55 @@ defmodule MCPEx.Client do
         {:ok, transport_to_use}
       end
     
-    with {:ok, transport} <- transport_result,
-         {:ok, server_info} <- initialize_connection(transport, capabilities, client_info) do
-      # Extract the server capabilities and info from the response
-      server_capabilities = Map.get(server_info, :capabilities) || 
-                           Map.get(server_info, "capabilities") || 
-                           # Initialize with basic capabilities for tests
-                           %{
-                             resources: %{subscribe: true},
-                             tools: %{},
-                             prompts: %{}
-                           }
-                           
-      server_info_data = Map.get(server_info, :server_info) || 
-                         Map.get(server_info, "server_info") || 
-                         # Initialize with basic server info for tests
-                         %{
-                           name: "TestServer",
-                           version: "1.0.0"
-                         }
+    with {:ok, transport} <- transport_result do 
+      # Register for transport process exit notifications
+      Process.monitor(transport)
       
-      # Create the server state
-      {:ok,
-       %{
-         transport: transport,
-         request_id: 0,
-         pending_requests: %{},
-         subscriptions: %{},
-         server_capabilities: server_capabilities,
-         server_info: server_info_data,
-         sampling_handler: sampling_handler || Sampling.default_handler()
-       }}
+      # Start initialization process
+      init_result = initialize_connection(transport, capabilities, client_info)
+      
+      case init_result do
+        {:ok, server_info} -> 
+          # Extract the server capabilities and info from the response
+          server_capabilities = Map.get(server_info, :capabilities) || 
+                             Map.get(server_info, "capabilities") || 
+                             # Initialize with basic capabilities for tests
+                             %{
+                               resources: %{subscribe: true},
+                               tools: %{},
+                               prompts: %{}
+                             }
+                             
+          server_info_data = Map.get(server_info, :server_info) || 
+                           Map.get(server_info, "server_info") || 
+                           # Initialize with basic server info for tests
+                           %{
+                             name: "TestServer",
+                             version: "1.0.0"
+                           }
+          
+          # Create the server state
+          {:ok,
+           %{
+             transport: transport,
+             request_id: 0,
+             pending_requests: %{},
+             subscriptions: %{},
+             server_capabilities: server_capabilities,
+             server_info: server_info_data,
+             sampling_handler: sampling_handler || Sampling.default_handler()
+           }}
+        
+        {:error, reason} -> 
+          # Close the transport and stop the process
+          try do
+            Transport.close(transport)
+          catch
+            _, _ -> :ok
+          end
+          
+          {:stop, reason}
+      end
     else
       {:error, reason} -> {:stop, reason}
     end
@@ -870,6 +988,80 @@ defmodule MCPEx.Client do
         handle_response(processed_response, state)
     end
   end
+  
+  # Enhanced transport process termination handler with stderr capture
+  @impl true
+  def handle_info({:DOWN, _ref, :process, transport_pid, reason}, %{transport: transport_pid} = state) do
+    # Try to get any captured stderr output from the transport
+    stderr_content = 
+      if Code.ensure_loaded?(MCPEx.Transport.Stdio) do
+        try do
+          MCPEx.Transport.Stdio.get_stderr_buffer(transport_pid)
+        catch
+          _, _ -> nil
+        end
+      else
+        nil
+      end
+    
+    Logger.warning("Transport process terminated with reason: #{inspect(reason)}, stderr captured: #{stderr_content != nil}")
+    
+    # Determine if this happened during initialization (all pending requests)
+    pending_request_ids = Map.keys(state.pending_requests)
+    
+    if length(pending_request_ids) > 0 do
+      # Reply to all pending requests with the error
+      for {_id, request_info} <- state.pending_requests do
+        # Extract from field depending on format
+        from = 
+          cond do
+            is_map(request_info) && Map.has_key?(request_info, :from) -> 
+              Map.get(request_info, :from)
+            is_map(request_info) && Map.has_key?(request_info, "from") -> 
+              Map.get(request_info, "from")
+            is_pid(request_info) -> 
+              request_info
+            is_tuple(request_info) && tuple_size(request_info) >= 1 && is_pid(elem(request_info, 0)) ->
+              request_info
+            true -> nil
+          end
+          
+        if from != nil do
+          # Format a more descriptive error message based on the reason and stderr
+          error_message = 
+            case reason do
+              {:exit, exit_code} when is_integer(exit_code) ->
+                if stderr_content && String.trim(stderr_content) != "" do
+                  # Include captured stderr in error message
+                  """
+                  MCP server process exited with code #{exit_code}.
+                  
+                  Error output:
+                  #{stderr_content}
+                  """
+                else
+                  # Exit code specific messages
+                  case exit_code do
+                    127 -> "Command not found (exit code 127). Please check that the executable exists and is in your PATH."
+                    126 -> "Permission denied (exit code 126). Please check file permissions."
+                    1 -> "MCP server exited with an error (exit code 1). Check server configuration."
+                    _ -> "MCP server process exited with code #{exit_code}. Check server logs for details."
+                  end
+                end
+              other ->
+                "MCP server process terminated unexpectedly: #{inspect(other)}"
+            end
+          
+          # Reply with the enhanced error
+          safe_reply(from, {:error, error_message})
+        end
+      end
+    end
+    
+    # Clean up and terminate
+    {:stop, {:transport_terminated, reason}, %{state | pending_requests: %{}}}
+  end
+  
   
   # Handle regular JSON-RPC responses
   defp handle_response(processed_response, state) do
@@ -1259,118 +1451,180 @@ defmodule MCPEx.Client do
       case send_request(transport, payload) do
         :ok ->
           Logger.debug("Initialize request sent successfully, waiting for response...")
+          
+          # Set up a reference to monitor the transport process
+          transport_ref = Process.monitor(transport)
+          
+          # Wait for response or process exit
           receive do
             {:transport_response, response} ->
+              # Demonitor the transport process
+              Process.demonitor(transport_ref, [:flush])
+              
               Logger.debug("Received initialize response: #{inspect(response)}")
             
-            # Ensure response is properly formatted
-            processed_response = case response do
-              response when is_binary(response) ->
-                # Parse the JSON response
-                Jason.decode!(response)
-                
-              # Handle properly formatted JSON-RPC responses with result field
-              %{"jsonrpc" => "2.0", "id" => _, "result" => result} ->
-                # Extract just the result for consistency
-                %{"result" => result}
-                
-              # Handle properly formatted JSON-RPC response with error field
-              %{"jsonrpc" => "2.0", "id" => _, "error" => error} ->
-                # Extract just the error for consistency  
-                %{"error" => error}
-                
-              # Already a map with result structure
-              response when is_map(response) ->
-                # Keep as is if it already has the correct structure
-                response
-                
-              # Special case for test responses in tuple format
-              {:ok, result} when is_map(result) ->
-                # Handle response from test servers
-                %{"result" => result}
-                
-              # Special case for error responses in tuple format
-              {:error, error} ->
-                # Handle error response from test servers
-                %{"error" => error}
-                
-              # Handle any other format that might come from tests
-              response -> 
-                # Wrap in a map if it's not already a map
-                if is_map(response), do: response, else: %{"result" => response}
-            end
-            
-            # Check for errors
-            cond do
-              # Handle error response
-              is_map(processed_response) && Map.has_key?(processed_response, "error") ->
-                error_data = Map.get(processed_response, "error")
-                Logger.error("Initialize error: #{inspect(error_data)}")
-                {:error, string_keys_to_atoms(error_data)}
-                
-              # Handle regular JSON-RPC response
-              is_map(processed_response) && Map.has_key?(processed_response, "result") ->
-                # Get the result field
-                result = Map.get(processed_response, "result")
-                
-                # Send initialized notification
-                initialized_payload = MCPEx.Protocol.JsonRpc.encode_notification("notifications/initialized", %{})
-                Logger.debug("Sending initialized notification: #{initialized_payload}")
-                send_request(transport, initialized_payload)
-                
-                # Process server info - handle both string and atom keys
-                capabilities_data = Map.get(result, "capabilities") || 
-                                   Map.get(result, :capabilities) || %{}
-                                   
-                server_info_data = Map.get(result, "serverInfo") || 
-                                  Map.get(result, :serverInfo) || 
-                                  %{"name" => "Unknown", "version" => "Unknown"}
-                
-                Logger.debug("Received capabilities: #{inspect(capabilities_data)}")
-                Logger.debug("Received server info: #{inspect(server_info_data)}")
-                
-                # Convert capabilities to proper structure with atom keys
-                processed_capabilities = process_capabilities(capabilities_data)
-                processed_server_info = string_keys_to_atoms(server_info_data)
-                
-                # Return the processed data
-                {:ok, %{
-                  capabilities: processed_capabilities,
-                  server_info: processed_server_info
-                }}
-                
-              # Special case for tests where response might be a direct result
-              is_map(processed_response) ->
-                # Send initialized notification
-                initialized_payload = MCPEx.Protocol.JsonRpc.encode_notification("notifications/initialized", %{})
-                Logger.debug("Sending initialized notification: #{initialized_payload}")
-                send_request(transport, initialized_payload)
-                
-                # Treat the whole response as the result if no "result" field
-                capabilities_data = Map.get(processed_response, "capabilities") || 
-                                    Map.get(processed_response, :capabilities) || %{}
-                                    
-                server_info_data = Map.get(processed_response, "serverInfo") || 
-                                  Map.get(processed_response, :serverInfo) || 
-                                  %{"name" => "Unknown", "version" => "Unknown"}
-                
-                # Convert capabilities to proper structure with atom keys
-                processed_capabilities = process_capabilities(capabilities_data)
-                processed_server_info = string_keys_to_atoms(server_info_data)
-                
-                # Return the processed data
-                {:ok, %{
-                  capabilities: processed_capabilities,
-                  server_info: processed_server_info
-                }}
-                
-              # Catch-all for unexpected formats
-              true ->
-                Logger.error("Unexpected initialize response format: #{inspect(processed_response)}")
-                {:error, "Invalid initialize response format"}
-            end
-            
+              # Ensure response is properly formatted
+              processed_response = case response do
+                response when is_binary(response) ->
+                  # Parse the JSON response
+                  Jason.decode!(response)
+                  
+                # Handle properly formatted JSON-RPC responses with result field
+                %{"jsonrpc" => "2.0", "id" => _, "result" => result} ->
+                  # Extract just the result for consistency
+                  %{"result" => result}
+                  
+                # Handle properly formatted JSON-RPC response with error field
+                %{"jsonrpc" => "2.0", "id" => _, "error" => error} ->
+                  # Extract just the error for consistency  
+                  %{"error" => error}
+                  
+                # Already a map with result structure
+                response when is_map(response) ->
+                  # Keep as is if it already has the correct structure
+                  response
+                  
+                # Special case for test responses in tuple format
+                {:ok, result} when is_map(result) ->
+                  # Handle response from test servers
+                  %{"result" => result}
+                  
+                # Special case for error responses in tuple format
+                {:error, error} ->
+                  # Handle error response from test servers
+                  %{"error" => error}
+                  
+                # Handle any other format that might come from tests
+                response -> 
+                  # Wrap in a map if it's not already a map
+                  if is_map(response), do: response, else: %{"result" => response}
+              end
+              
+              # Check for errors
+              cond do
+                # Handle error response
+                is_map(processed_response) && Map.has_key?(processed_response, "error") ->
+                  error_data = Map.get(processed_response, "error")
+                  Logger.error("Initialize error: #{inspect(error_data)}")
+                  {:error, string_keys_to_atoms(error_data)}
+                  
+                # Handle regular JSON-RPC response
+                is_map(processed_response) && Map.has_key?(processed_response, "result") ->
+                  # Get the result field
+                  result = Map.get(processed_response, "result")
+                  
+                  # Send initialized notification
+                  initialized_payload = MCPEx.Protocol.JsonRpc.encode_notification("notifications/initialized", %{})
+                  Logger.debug("Sending initialized notification: #{initialized_payload}")
+                  send_request(transport, initialized_payload)
+                  
+                  # Process server info - handle both string and atom keys
+                  capabilities_data = Map.get(result, "capabilities") || 
+                                     Map.get(result, :capabilities) || %{}
+                                     
+                  server_info_data = Map.get(result, "serverInfo") || 
+                                    Map.get(result, :serverInfo) || 
+                                    %{"name" => "Unknown", "version" => "Unknown"}
+                  
+                  Logger.debug("Received capabilities: #{inspect(capabilities_data)}")
+                  Logger.debug("Received server info: #{inspect(server_info_data)}")
+                  
+                  # Convert capabilities to proper structure with atom keys
+                  processed_capabilities = process_capabilities(capabilities_data)
+                  processed_server_info = string_keys_to_atoms(server_info_data)
+                  
+                  # Return the processed data
+                  {:ok, %{
+                    capabilities: processed_capabilities,
+                    server_info: processed_server_info
+                  }}
+                  
+                # Special case for tests where response might be a direct result
+                is_map(processed_response) ->
+                  # Send initialized notification
+                  initialized_payload = MCPEx.Protocol.JsonRpc.encode_notification("notifications/initialized", %{})
+                  Logger.debug("Sending initialized notification: #{initialized_payload}")
+                  send_request(transport, initialized_payload)
+                  
+                  # Treat the whole response as the result if no "result" field
+                  capabilities_data = Map.get(processed_response, "capabilities") || 
+                                      Map.get(processed_response, :capabilities) || %{}
+                                      
+                  server_info_data = Map.get(processed_response, "serverInfo") || 
+                                    Map.get(processed_response, :serverInfo) || 
+                                    %{"name" => "Unknown", "version" => "Unknown"}
+                  
+                  # Convert capabilities to proper structure with atom keys
+                  processed_capabilities = process_capabilities(capabilities_data)
+                  processed_server_info = string_keys_to_atoms(server_info_data)
+                  
+                  # Signal the transport to stop buffering stderr since initialization is complete
+                  if Code.ensure_loaded?(MCPEx.Transport.Stdio) do
+                    try do
+                      MCPEx.Transport.Stdio.stop_buffering_stderr(transport)
+                    catch
+                      _, _ -> :ok  # Ignore errors
+                    end
+                  end
+                  
+                  # Return the processed data
+                  {:ok, %{
+                    capabilities: processed_capabilities,
+                    server_info: processed_server_info
+                  }}
+                  
+                # Catch-all for unexpected formats
+                true ->
+                  Logger.error("Unexpected initialize response format: #{inspect(processed_response)}")
+                  {:error, "Invalid initialize response format"}
+              end
+              
+            # NEW: Handle transport process exit during initialization  
+            {:DOWN, ^transport_ref, :process, _pid, reason} ->
+              # Try to get any stderr output collected during initialization
+              stderr_content = 
+                if Code.ensure_loaded?(MCPEx.Transport.Stdio) do
+                  try do
+                    MCPEx.Transport.Stdio.get_stderr_buffer(transport)
+                  catch
+                    _, _ -> nil
+                  end
+                else
+                  nil
+                end
+              
+              # Create a descriptive error message based on the reason and stderr
+              error_message = 
+                case reason do
+                  {:exit, exit_code} when is_integer(exit_code) ->
+                    if stderr_content && String.trim(stderr_content) != "" do
+                      """
+                      MCP server process exited with code #{exit_code} during initialization.
+                      
+                      Error output:
+                      #{stderr_content}
+                      """
+                    else
+                      # Exit code specific messages
+                      case exit_code do
+                        127 -> "Command not found (exit code 127). Please check that the executable exists and is in your PATH."
+                        126 -> "Permission denied (exit code 126). Please check file permissions."
+                        1 -> "MCP server exited with an error (exit code 1). Check server configuration."
+                        _ -> "MCP server process exited with code #{exit_code} during initialization. Check server logs for details."
+                      end
+                    end
+                    
+                  other ->
+                    "MCP server process terminated unexpectedly during initialization: #{inspect(other)}"
+                end
+              
+              Logger.error(error_message)
+              {:error, error_message}
+              
           after 30000 -> # Extended timeout for npx initialization
+            # Demonitor the transport process
+            Process.demonitor(transport_ref, [:flush])
+            
             Logger.error("Initialize timeout after 30 seconds")
             {:error, "Initialize timeout"}
           end
