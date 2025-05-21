@@ -39,8 +39,14 @@ debug "STDERR_LOG_FILE: $STDERR_LOG_FILE"
 cleanup() {
     debug "Cleanup called at $(date)"
     rm -rf "$TEMP_DIR"
+    # Make sure we exit with the right code
+    debug "Ensuring exit code: $CMD_EXIT"
+    exit $CMD_EXIT
 }
 trap cleanup EXIT
+
+# Also trap SIGTERM to ensure we exit with the right code
+trap 'debug "Received SIGTERM"; cleanup' TERM
 
 # Start background process for processing stdout
 cat "$STDOUT_FIFO" | while IFS= read -r line || [[ -n "$line" ]]; do
@@ -76,13 +82,21 @@ debug "About to execute command: $*"
 # This helps ensure we see output immediately instead of waiting for buffer flushes
 if command -v stdbuf >/dev/null 2>&1; then
     debug "Using stdbuf to disable output buffering"
+    
+    # Run the command directly, no background process
+    # This is simpler and more reliable
     stdbuf -i0 -o0 -e0 "$@" < /dev/stdin > "$STDOUT_FIFO" 2> "$STDERR_FIFO"
+    COMMAND_EXIT=$?
+    debug "Command completed with exit code: $COMMAND_EXIT"
 else
     debug "stdbuf not available, running command directly"
+    # Run the command directly, no background process
     "$@" < /dev/stdin > "$STDOUT_FIFO" 2> "$STDERR_FIFO"
+    COMMAND_EXIT=$?
+    debug "Command completed with exit code: $COMMAND_EXIT"
 fi
 
-CMD_EXIT=$?
+CMD_EXIT=$COMMAND_EXIT
 debug "Command execution completed with exit code: $CMD_EXIT"
 
 # Log command completion
@@ -91,12 +105,16 @@ debug "Command finished at $(date) with exit code $CMD_EXIT"
 # Send explicit error message for non-zero exit codes
 if [ $CMD_EXIT -ne 0 ]; then
     debug "COMMAND FAILED: '$*' exited with status: $CMD_EXIT"
-    echo "[STDERR] Command '$*' exited with non-zero status: $CMD_EXIT" 
+    # Add a special marker for the Elixir process to detect failure
+    echo "[STDERR] ##MCP_ERROR## Command '$*' exited with status: $CMD_EXIT" 
     
     # Also log to the stderr log file
     if [ "$STDERR_LOG_FILE" != "/dev/null" ]; then
         echo "Command '$*' exited with non-zero status: $CMD_EXIT" >> "$STDERR_LOG_FILE"
     fi
+else
+    # Add success marker for zero exit code
+    echo "[STDERR] ##MCP_SUCCESS## Command completed successfully"
 fi
 
 # Close the FIFOs to ensure the background processes complete
@@ -105,6 +123,10 @@ exec 3>"$STDOUT_FIFO"
 exec 4>"$STDERR_FIFO"
 exec 3>&-
 exec 4>&-
+
+# Make sure we actually exit with the right exit code
+debug "Exiting with code $CMD_EXIT"
+exit $CMD_EXIT
 
 # Wait for the background processes to finish
 debug "Waiting for STDOUT processor"

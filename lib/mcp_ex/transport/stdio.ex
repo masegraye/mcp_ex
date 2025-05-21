@@ -228,7 +228,14 @@ defmodule MCPEx.Transport.Stdio do
           # CRITICAL: port MUST be included in the state for Port.command to work
           # Make sure we're using actual port (not just the :ok result from try)
           if is_port(port) do
-            final_state = Map.put(init_state, :port, port)
+            # Set up monitoring for the port
+            port_ref = Port.monitor(port)
+            Logger.debug("Set up port monitoring with ref: #{inspect(port_ref)}")
+            
+            final_state = init_state
+              |> Map.put(:port, port)
+              |> Map.put(:port_ref, port_ref)
+              
             Logger.debug("Returning state with port: #{inspect(Map.get(final_state, :port))}")
             {:ok, final_state}
           else
@@ -275,7 +282,15 @@ defmodule MCPEx.Transport.Stdio do
             port = Port.open({:spawn_executable, exec_path}, port_options)
             # Initialize with our full state including stderr buffering
             # CRITICAL: port MUST be included in the state for Port.command to work
-            final_state = Map.put(init_state, :port, port)
+            
+            # Set up monitoring for the port
+            port_ref = Port.monitor(port)
+            Logger.debug("Set up port monitoring with ref: #{inspect(port_ref)}")
+            
+            final_state = init_state
+              |> Map.put(:port, port)
+              |> Map.put(:port_ref, port_ref)
+              
             Logger.debug("Returning state with port: #{inspect(Map.get(final_state, :port))}")
             {:ok, final_state}
         end
@@ -385,6 +400,9 @@ defmodule MCPEx.Transport.Stdio do
 
   @impl true
   def handle_info({port, {:data, data}}, %{port: port} = state) do
+    # Verify port is still valid in our state
+    Logger.debug("Received data message, state port value: #{inspect(Map.get(state, :port))}")
+    Logger.debug("Port is a valid port? #{is_port(Map.get(state, :port))}")
     cond do
       String.starts_with?(data, "[STDERR] ") ->
         # Handle stderr output
@@ -398,9 +416,53 @@ defmodule MCPEx.Transport.Stdio do
           else
             state.stderr_buffer
           end
-        
-        # We don't relay stderr to parent - it's for diagnostics only
-        {:noreply, %{state | stderr_buffer: stderr_buffer}}
+          
+        # Check for our special error marker
+        if String.contains?(stderr_line, "##MCP_ERROR##") do
+          Logger.warning("Detected command failure marker: #{stderr_line}")
+          
+          # Extract exit code if possible
+          exit_code = 
+            case Regex.run(~r/exited with status: (\d+)/, stderr_line) do
+              [_, code] -> String.to_integer(code)
+              _ -> 1 # Default exit code if we can't parse it
+            end
+          
+          # Create a detailed error message that includes the actual stderr output
+          error_message = "Command failed with exit code #{exit_code}.\n\nError details:\n#{stderr_buffer}"
+          Logger.error("Command error: #{error_message}")
+          
+          # Find linked processes and send error response
+          if parent = Process.info(self(), :links) do
+            Enum.each(elem(parent, 1), fn pid ->
+              if is_pid(pid) and Process.alive?(pid) do
+                # Format as a JSON-RPC error response
+                error_response = %{
+                  "jsonrpc" => "2.0",
+                  "id" => 1,
+                  "error" => %{
+                    "code" => -32000,
+                    "message" => error_message,
+                    "data" => %{
+                      "exit_code" => exit_code,
+                      "stderr" => stderr_buffer
+                    }
+                  }
+                }
+                
+                # Send the error response
+                Logger.warning("Sending error response to client: #{inspect(pid)}")
+                send(pid, {:transport_response, error_response})
+              end
+            end)
+          end
+          
+          # Stop the process since we've handled the error
+          {:stop, :normal, %{state | stderr_buffer: stderr_buffer}}
+        else
+          # No error marker, just update buffer
+          {:noreply, %{state | stderr_buffer: stderr_buffer}}
+        end
       
       String.starts_with?(data, "[STDOUT] ") ->
         # Handle stdout output - strip the prefix
@@ -474,7 +536,10 @@ defmodule MCPEx.Transport.Stdio do
   @impl true
   def handle_info({port, {:exit_status, status}}, %{port: port} = state) do
     # Enhanced logging for process termination
-    Logger.warning("Stdio transport process exited with status #{status}")
+    Logger.warning(">>>>> Stdio transport process exited with status #{status} <<<<<")
+    Logger.warning("Got exit_status message for port: #{inspect(port)}")
+    Logger.warning("Our tracked port is: #{inspect(state.port)}")
+    Logger.warning("Ports match: #{port == state.port}")
     
     # Try to get any buffered stderr content
     stderr_content = Map.get(state, :stderr_buffer, "")
@@ -484,6 +549,41 @@ defmodule MCPEx.Transport.Stdio do
       Logger.warning("No stderr buffer available at process exit (status #{status})")
     end
     
+    # For non-zero exit status, we need to notify any waiting clients
+    # because otherwise they will time out waiting for initialize response
+    if status != 0 do
+      # Find all linked processes (clients) and send them an error
+      if parent = Process.info(self(), :links) do
+        error_message = if stderr_content && stderr_content != "" do
+          "Command exited with status #{status}. Error: #{String.trim(stderr_content)}"
+        else
+          "Command exited with status #{status}"
+        end
+        
+        # Send an error to each linked process
+        Enum.each(elem(parent, 1), fn pid ->
+          if is_pid(pid) and Process.alive?(pid) do
+            # Format as a JSON-RPC error response
+            error_response = %{
+              "jsonrpc" => "2.0",
+              "id" => 1,
+              "error" => %{
+                "code" => -32000,
+                "message" => error_message,
+                "data" => %{
+                  "exit_code" => status,
+                  "stderr" => stderr_content
+                }
+              }
+            }
+            
+            # Send as a transport response
+            send(pid, {:transport_response, error_response})
+          end
+        end)
+      end
+    end
+    
     # Return normal termination message, don't raise an exception
     # This is triggered normally when using the wrapper script
     if status == 0 do
@@ -491,54 +591,156 @@ defmodule MCPEx.Transport.Stdio do
       Logger.debug("Process terminated normally with status 0")
       {:stop, :normal, state}
     else
-      # Non-zero status is an error
+      # Non-zero status is an error, but we've already notified clients
+      # so we can gracefully stop now
       Logger.error("Process terminated with error status #{status}")
       {:stop, {:exit, status}, state}
     end
   end
   
   @impl true
-  def handle_info({port, :closed}, %{port: port} = state) do
-    Logger.warning("Port closed message received")
+  def handle_info({port, :closed}, state) do
+    Logger.warning("Port closed message received from #{inspect(port)}")
     
-    # Check if we have any stderr buffer
-    stderr_content = Map.get(state, :stderr_buffer, "")
-    if stderr_content && stderr_content != "" do
-      Logger.error("Stderr buffer at port closed:\n#{stderr_content}")
+    # Check if this is our tracked port
+    is_our_port = state.port == port
+    Logger.debug("Is this our tracked port? #{is_our_port}")
+    
+    if is_our_port do
+      # Check if we have any stderr buffer
+      stderr_content = Map.get(state, :stderr_buffer, "")
+      if stderr_content && stderr_content != "" do
+        Logger.error("Stderr buffer at port closed:\n#{stderr_content}")
+        
+        # Find linked processes and send error
+        if parent = Process.info(self(), :links) do
+          error_message = "Command execution failed. Error output:\n#{stderr_content}"
+          
+          # Send an error to each linked process
+          Enum.each(elem(parent, 1), fn pid ->
+            if is_pid(pid) and Process.alive?(pid) do
+              # Format as a JSON-RPC error response
+              error_response = %{
+                "jsonrpc" => "2.0",
+                "id" => 1,
+                "error" => %{
+                  "code" => -32000,
+                  "message" => error_message,
+                  "data" => %{
+                    "stderr" => stderr_content
+                  }
+                }
+              }
+              
+              # Send as a transport response
+              Logger.debug("Sending error response to client: #{inspect(pid)}")
+              send(pid, {:transport_response, error_response})
+            end
+          end)
+        end
+      else
+        Logger.warning("No stderr buffer available when port closed")
+      end
+      
+      # Stop the process since the port is closed
+      Logger.debug("Stopping process since port is closed")
+      {:stop, :normal, state}
     else
-      Logger.warning("No stderr buffer available when port closed")
+      # Not our port, just continue
+      {:noreply, state}
     end
-    
-    # Note: We're just logging and continuing here, not stopping the process
-    # This is because the :exit_status message should follow shortly and will handle the actual termination
-    {:noreply, state}
   end
 
   @impl true
   def handle_info(msg, state) do
     Logger.debug("Unhandled message in stdio transport: #{inspect(msg)}")
+    Logger.debug("Our tracked port is: #{inspect(state.port)}")
     
-    # More detailed logging for port-related messages
+    # Check if the port is still alive and get info
+    if is_port(state.port) do
+      port_info = Port.info(state.port)
+      Logger.debug("Current port info: #{inspect(port_info)}")
+    else
+      Logger.debug("state.port is not a valid port: #{inspect(state.port)}")
+    end
+    
+    # Handle different message types
     case msg do
       {port, _} when is_port(port) ->
         # This is a port-related message that we're not explicitly handling
         Logger.warning("Unhandled port message received: #{inspect(msg)}")
+        port_info = Port.info(port)
+        Logger.debug("Unhandled port info: #{inspect(port_info)}")
+        
         # If this port matches our state's port, log that too
         if Map.get(state, :port) == port do
           Logger.warning("Message is from our tracked port")
         end
-      {:DOWN, _ref, :port, port, reason} ->
+        
+        {:noreply, state}
+        
+      {:DOWN, ref, :port, port, reason} ->
         # Port monitor message
         Logger.warning("Port monitor :DOWN message received: #{inspect(reason)}")
-        if Map.get(state, :port) == port do
-          Logger.warning("DOWN message is for our tracked port")
+        # Check if this is our tracked port and our monitor ref
+        # Note: state.port might be nil if the port was already closed or crashed
+        our_port = Map.get(state, :port) == port
+        our_ref = Map.get(state, :port_ref) == ref
+        
+        Logger.warning("DOWN message port matches our port: #{our_port}")
+        Logger.warning("DOWN message ref matches our ref: #{our_ref}")
+        Logger.warning("Our current port is: #{inspect(Map.get(state, :port))}")
+        
+        # If our current port is nil but the ref matches, this is still our port
+        # This can happen if the port died unexpectedly
+        if our_port || our_ref || (Map.get(state, :port) == nil && Map.get(state, :port_ref) == ref) do
+          # This is for our tracked port, handle as a port exit
+          Logger.warning("DOWN message is for our tracked port, handling as port exit")
+          
+          # Try to get any buffered stderr content
+          stderr_content = Map.get(state, :stderr_buffer, "")
+          if stderr_content && stderr_content != "" do
+            Logger.error("Stderr buffer at port down:\n#{stderr_content}")
+            
+            # Find linked processes and send error
+            if parent = Process.info(self(), :links) do
+              error_message = "Command failed. Error output:\n#{stderr_content}"
+              
+              # Send an error to each linked process
+              Enum.each(elem(parent, 1), fn pid ->
+                if is_pid(pid) and Process.alive?(pid) do
+                  # Format as a JSON-RPC error response
+                  error_response = %{
+                    "jsonrpc" => "2.0",
+                    "id" => 1,
+                    "error" => %{
+                      "code" => -32000,
+                      "message" => error_message,
+                      "data" => %{
+                        "stderr" => stderr_content
+                      }
+                    }
+                  }
+                  
+                  # Send as a transport response
+                  Logger.debug("Sending error response to client: #{inspect(pid)}")
+                  send(pid, {:transport_response, error_response})
+                end
+              end)
+            end
+          end
+          
+          # Stop the GenServer with the reason from the DOWN message
+          {:stop, {:port_down, reason}, state}
+        else
+          # Not our port or ref, just continue
+          {:noreply, state}
         end
+        
       _ ->
         # Some other message type
-        :ok
+        {:noreply, state}
     end
-    
-    {:noreply, state}
   end
 
   # Private helpers
