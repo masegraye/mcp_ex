@@ -30,7 +30,7 @@ defmodule MCPEx.Transport.Stdio do
   def start_link(options) do
     GenServer.start_link(__MODULE__, options)
   end
-  
+
   @doc """
   Gets any captured stderr output that was buffered.
   This is useful for diagnosing initialization failures.
@@ -45,7 +45,7 @@ defmodule MCPEx.Transport.Stdio do
       _, _ -> nil
     end
   end
-  
+
   @doc """
   Stops buffering stderr. Called by the client after initialization is complete.
   """
@@ -62,6 +62,9 @@ defmodule MCPEx.Transport.Stdio do
 
   @impl true
   def init(options) do
+    Logger.warning("STDIO TRANSPORT INIT START: #{inspect(self())}")
+    Process.flag(:trap_exit, true)
+    
     command = Keyword.fetch!(options, :command)
     args = Keyword.get(options, :args, [])
     cd = Keyword.get(options, :cd, File.cwd!())
@@ -84,7 +87,7 @@ defmodule MCPEx.Transport.Stdio do
       {:cd, cd},
       {:env, env}
     ]
-    
+
     # Initialize with buffer and stderr buffering enabled
     init_state = %{
       buffer: "",          # Normal data buffer
@@ -96,12 +99,12 @@ defmodule MCPEx.Transport.Stdio do
       # Check if we should use CommandUtils for enhanced shell environment
       if use_shell_env && Code.ensure_loaded?(MCPEx.Utils.CommandUtils) do
         Logger.debug("Using direct Port.open approach for shell-wrapped command")
-        
+
         # For shell-wrapped commands, we don't need to add an additional shell layer
         # Instead, open the port directly with the given command and args
         Logger.debug("Attempting to open port with executable: #{command}")
         Logger.debug("Full port options: #{inspect(port_options ++ [{:args, Enum.map(args, &String.to_charlist/1)}])}")
-        
+
         Logger.debug("About to try opening port")
         port = try do
           # Verify the command path exists
@@ -115,68 +118,68 @@ defmodule MCPEx.Transport.Stdio do
                 if (mode &&& 0o111) != 0 do
                   # Executable bit is set, try to open the port
                   Logger.debug("Command exists and is executable. Opening port...")
-                  
+
                   # Following the approach that works in CommandUtils.execute_through_port
-                  
+
                   # Convert to charlist for exec path explicitly
                   exec_path = String.to_charlist(command)
-                  
+
                   # Basic port options - keep it simple and identical to CommandUtils
                   port_options = [:binary, :exit_status, :use_stdio]
-                  
+
                   # Add cd option if needed (must be charlist)
                   port_options = if cd != nil && cd != "", do: port_options ++ [{:cd, cd}], else: port_options
-                  
+
                   # Add env option if needed - MUST BE CHARLIST TUPLES
                   env_list = case env do
-                    env when is_list(env) -> 
+                    env when is_list(env) ->
                       # Convert each element to ensure it's a charlist tuple
-                      Enum.map(env, fn 
+                      Enum.map(env, fn
                         {k, v} when is_binary(k) and is_binary(v) -> {String.to_charlist(k), String.to_charlist(v)}
                         {k, v} when is_binary(k) -> {String.to_charlist(k), to_charlist(v)}
                         {k, v} when is_binary(v) -> {to_charlist(k), String.to_charlist(v)}
                         entry -> entry # Keep as is if we can't convert
                       end)
-                    
-                    env when is_map(env) -> 
+
+                    env when is_map(env) ->
                       # Convert map to list of tuples with charlists
-                      env |> Enum.map(fn {k, v} -> 
+                      env |> Enum.map(fn {k, v} ->
                         {String.to_charlist("#{k}"), String.to_charlist("#{v}")}
                       end)
-                    
+
                     _ -> []  # Default to empty list
                   end
-                  
+
                   # Debug print the env list
                   Logger.debug("ENV LIST for port: #{inspect(env_list)}")
-                  
+
                   # Only add env if not empty
                   port_options = if length(env_list) > 0, do: port_options ++ [{:env, env_list}], else: port_options
-                  
+
                   # Convert args to charlists
-                  char_args = Enum.map(args, fn arg -> 
+                  char_args = Enum.map(args, fn arg ->
                     cond do
                       is_binary(arg) -> String.to_charlist(arg)
                       is_list(arg) and is_integer(hd(arg)) -> arg  # Already a charlist
                       true -> to_charlist("#{arg}")  # Convert anything else
                     end
                   end)
-                  
+
                   # Add args option
                   port_options = port_options ++ [{:args, char_args}]
-                  
+
                   Logger.debug("FINAL port_options = #{inspect(port_options)}")
-                  
+
                   # Open port with simplified options
                   port_result = Port.open({:spawn_executable, exec_path}, port_options)
-                  
+
                   # Get the OS PID from the port
                   os_pid =
                     case Port.info(port_result, :os_pid) do
                       {:os_pid, pid} when is_integer(pid) -> "#{pid}"
                       _ -> "unknown"
                     end
-                    
+
                   Logger.debug("Port opened successfully with PID: #{os_pid}")
                   port_result
                 else
@@ -197,31 +200,34 @@ defmodule MCPEx.Transport.Stdio do
             Logger.error("Caught #{kind} while opening port: #{inspect(reason)}")
             nil
         end
-        
+
         Logger.debug("After try block, port value is: #{inspect(port)}")
-        
+
         # Check if we got a valid port
         if is_nil(port) do
           Logger.error("Failed to open port for command: #{command}")
-          {:error, "Failed to open port for command: #{command}"}
-        else          
+          # Close the port if it exists before returning error
+          if is_port(port), do: Port.close(port)
+          Logger.warning("STDIO TRANSPORT RETURNING STOP: Failed to open port")
+          {:stop, "Failed to open port for command: #{command}"}
+        else
           # Get the OS PID from the port
           os_pid =
             case Port.info(port, :os_pid) do
               {:os_pid, pid} when is_integer(pid) -> "#{pid}"
               _ -> "unknown"
             end
-          
+
           # Store the needs_shell_delay value in the process dictionary
           # so the client can check it when initializing
           if needs_shell_delay do
             Logger.debug("Setting needs_shell_delay in process dictionary")
             Process.put(:"$needs_shell_delay", true)
           end
-          
+
           Logger.debug("Started shell-wrapped command directly with PID: #{os_pid}")
           # No need to create an unused variable
-          
+
           # Port is open and we have the OS PID
           Logger.debug("Started command through shell with PID: #{os_pid}")
           # Initialize with our full state including stderr buffering
@@ -231,45 +237,48 @@ defmodule MCPEx.Transport.Stdio do
             # Set up monitoring for the port
             port_ref = Port.monitor(port)
             Logger.debug("Set up port monitoring with ref: #{inspect(port_ref)}")
-            
+
             final_state = init_state
               |> Map.put(:port, port)
               |> Map.put(:port_ref, port_ref)
-              
+
             Logger.debug("Returning state with port: #{inspect(Map.get(final_state, :port))}")
             {:ok, final_state}
           else
             Logger.error("Port variable is not a valid port: #{inspect(port)}")
-            {:error, "Failed to get a valid port object"}
+            # Close the port if it exists before returning error
+            if is_port(port), do: Port.close(port)
+            {:stop, "Failed to get a valid port object"}
           end
         end
       else
         # Fall back to standard approach if CommandUtils is not available
         Logger.debug("Using standard Port.open approach (CommandUtils not available)")
-        
+
         case System.find_executable(command) do
           nil ->
             # Return as a normal tuple for testing purposes
-            {:error, "Command not found: #{command}"}
+            Logger.warning("STDIO TRANSPORT RETURNING STOP: Command not found: #{command}")
+            {:stop, "Command not found: #{command}"}
 
           command_path ->
             # If we should use the wrapper, set it up
-            {exec_path, exec_args} = 
+            {exec_path, exec_args} =
               if use_wrapper do
                 wrapper_path = Application.app_dir(:mcp_ex, "priv/scripts/wrapper.sh")
                 final_path = wrapper_path
                 final_args = [command_path | args]
-                
+
                 # Log the full command with wrapper
                 Logger.debug("Using wrapper script to run command")
                 Logger.debug("Wrapper path: #{wrapper_path}")
                 Logger.debug("Final command: #{wrapper_path} #{Enum.join([command_path | args], " ")}")
-                
+
                 {final_path, final_args}
               else
                 Logger.debug("Running command directly (no wrapper)")
                 Logger.debug("Final command: #{command_path} #{Enum.join(args, " ")}")
-                
+
                 {command_path, args}
               end
 
@@ -282,22 +291,27 @@ defmodule MCPEx.Transport.Stdio do
             port = Port.open({:spawn_executable, exec_path}, port_options)
             # Initialize with our full state including stderr buffering
             # CRITICAL: port MUST be included in the state for Port.command to work
-            
+
             # Set up monitoring for the port
             port_ref = Port.monitor(port)
             Logger.debug("Set up port monitoring with ref: #{inspect(port_ref)}")
-            
+
             final_state = init_state
               |> Map.put(:port, port)
               |> Map.put(:port_ref, port_ref)
-              
+
             Logger.debug("Returning state with port: #{inspect(Map.get(final_state, :port))}")
             {:ok, final_state}
         end
       end
     catch
-      _kind, reason ->
-        {:error, "Error starting process: #{inspect(reason)}"}
+      kind, reason ->
+        # Close the port if it exists before returning error
+        if Map.has_key?(init_state, :port) and is_port(init_state.port) do
+          Port.close(init_state.port)
+        end
+        Logger.warning("STDIO TRANSPORT RETURNING STOP FROM CATCH: #{kind} #{inspect(reason)}")
+        {:stop, "Error starting process: #{inspect(reason)}"}
     end
   end
 
@@ -334,17 +348,17 @@ defmodule MCPEx.Transport.Stdio do
   def handle_call({:send, message}, _from, state) do
     # Add a newline terminator to the message
     message_with_newline = message <> "\n"
-    
+
     # Send the message to the port
     result = Port.command(state.port, message_with_newline)
-    
+
     if result do
       {:reply, :ok, state}
     else
       {:reply, {:error, "Failed to send message"}, state}
     end
   end
-  
+
   @impl true
   def handle_call(:get_stderr_buffer, _from, state) do
     # Return the current stderr buffer
@@ -357,7 +371,7 @@ defmodule MCPEx.Transport.Stdio do
       if state.port do
         # First check if the port is still alive/valid
         port_info = Port.info(state.port)
-        
+
         if port_info != nil do
           # Send close signal to port directly - ignore errors
           try do
@@ -367,7 +381,7 @@ defmodule MCPEx.Transport.Stdio do
           catch
             _, _ -> :ok
           end
-          
+
           # Also use Port.close to ensure it's closed - ignore errors
           try do
             Port.close(state.port)
@@ -379,15 +393,15 @@ defmodule MCPEx.Transport.Stdio do
         end
       end
     rescue
-      error -> 
+      error ->
         # Log the error and continue
         Logger.error("Error closing port: #{inspect(error)}")
     catch
-      kind, reason -> 
+      kind, reason ->
         # Log any errors and continue
         Logger.error("Error closing port: #{inspect(kind)}, #{inspect(reason)}")
     end
-    
+
     # Always return OK
     {:reply, :ok, %{state | port: nil}}
   end
@@ -408,30 +422,30 @@ defmodule MCPEx.Transport.Stdio do
         # Handle stderr output
         stderr_line = String.slice(data, 9, String.length(data))
         Logger.debug("STDERR: #{stderr_line}")
-        
+
         # Buffer stderr if buffering is enabled (default during initialization)
-        stderr_buffer = 
+        stderr_buffer =
           if Map.get(state, :buffer_stderr, true) do
             state.stderr_buffer <> stderr_line <> "\n"
           else
             state.stderr_buffer
           end
-          
+
         # Check for our special error marker
         if String.contains?(stderr_line, "##MCP_ERROR##") do
           Logger.warning("Detected command failure marker: #{stderr_line}")
-          
+
           # Extract exit code if possible
-          exit_code = 
+          exit_code =
             case Regex.run(~r/exited with status: (\d+)/, stderr_line) do
               [_, code] -> String.to_integer(code)
               _ -> 1 # Default exit code if we can't parse it
             end
-          
+
           # Create a detailed error message that includes the actual stderr output
           error_message = "Command failed with exit code #{exit_code}.\n\nError details:\n#{stderr_buffer}"
           Logger.error("Command error: #{error_message}")
-          
+
           # Find linked processes and send error response
           if parent = Process.info(self(), :links) do
             Enum.each(elem(parent, 1), fn pid ->
@@ -449,36 +463,42 @@ defmodule MCPEx.Transport.Stdio do
                     }
                   }
                 }
-                
+
                 # Send the error response
                 Logger.warning("Sending error response to client: #{inspect(pid)}")
                 send(pid, {:transport_response, error_response})
               end
             end)
           end
-          
+
+          # Close the port before stopping the process
+          if is_port(state.port) do
+            Logger.debug("Closing port before stopping due to error")
+            Port.close(state.port)
+          end
+
           # Stop the process since we've handled the error
           {:stop, :normal, %{state | stderr_buffer: stderr_buffer}}
         else
           # No error marker, just update buffer
           {:noreply, %{state | stderr_buffer: stderr_buffer}}
         end
-      
+
       String.starts_with?(data, "[STDOUT] ") ->
         # Handle stdout output - strip the prefix
         stdout_data = String.slice(data, 9, String.length(data))
-        
+
         # For regular data processing, append to standard buffer
         new_buffer = state.buffer <> stdout_data
-        
+
         # Process complete messages
         {messages, remaining_buffer} = extract_messages(new_buffer)
-        
+
         # Send complete messages to the client
         Enum.each(messages, fn message ->
           # Log the message for debugging
           Logger.debug("Received message from process: #{inspect(message)}")
-          
+
           # For each client listening to this process, forward the message
           # This is critical for stdio communication
           if parent = Process.info(self(), :links) do
@@ -486,9 +506,9 @@ defmodule MCPEx.Transport.Stdio do
               if is_pid(pid) and Process.alive?(pid) do
                 # Try to parse the message as JSON first, then forward
                 case Jason.decode(message) do
-                  {:ok, parsed} -> 
+                  {:ok, parsed} ->
                     send(pid, {:transport_response, parsed})
-                  _ -> 
+                  _ ->
                     # If not valid JSON, send the raw message
                     send(pid, {:transport_response, message})
                 end
@@ -496,31 +516,31 @@ defmodule MCPEx.Transport.Stdio do
             end)
           end
         end)
-        
+
         {:noreply, %{state | buffer: remaining_buffer}}
-      
+
       true ->
         # Fallback for untagged data (no wrapper or direct output)
         # Append new data to buffer
         new_buffer = state.buffer <> data
-        
+
         # Process complete messages
         {messages, remaining_buffer} = extract_messages(new_buffer)
-        
+
         # Send complete messages to the client
         Enum.each(messages, fn message ->
           # Log the message for debugging
           Logger.debug("Received untagged message from process: #{inspect(message)}")
-          
+
           # For each client listening to this process, forward the message
           if parent = Process.info(self(), :links) do
             Enum.each(elem(parent, 1), fn pid ->
               if is_pid(pid) and Process.alive?(pid) do
                 # Try to parse the message as JSON first, then forward
                 case Jason.decode(message) do
-                  {:ok, parsed} -> 
+                  {:ok, parsed} ->
                     send(pid, {:transport_response, parsed})
-                  _ -> 
+                  _ ->
                     # If not valid JSON, send the raw message
                     send(pid, {:transport_response, message})
                 end
@@ -528,7 +548,7 @@ defmodule MCPEx.Transport.Stdio do
             end)
           end
         end)
-        
+
         {:noreply, %{state | buffer: remaining_buffer}}
     end
   end
@@ -540,7 +560,7 @@ defmodule MCPEx.Transport.Stdio do
     Logger.warning("Got exit_status message for port: #{inspect(port)}")
     Logger.warning("Our tracked port is: #{inspect(state.port)}")
     Logger.warning("Ports match: #{port == state.port}")
-    
+
     # Try to get any buffered stderr content
     stderr_content = Map.get(state, :stderr_buffer, "")
     if stderr_content && stderr_content != "" do
@@ -548,7 +568,7 @@ defmodule MCPEx.Transport.Stdio do
     else
       Logger.warning("No stderr buffer available at process exit (status #{status})")
     end
-    
+
     # For non-zero exit status, we need to notify any waiting clients
     # because otherwise they will time out waiting for initialize response
     if status != 0 do
@@ -559,7 +579,7 @@ defmodule MCPEx.Transport.Stdio do
         else
           "Command exited with status #{status}"
         end
-        
+
         # Send an error to each linked process
         Enum.each(elem(parent, 1), fn pid ->
           if is_pid(pid) and Process.alive?(pid) do
@@ -576,14 +596,17 @@ defmodule MCPEx.Transport.Stdio do
                 }
               }
             }
-            
+
             # Send as a transport response
             send(pid, {:transport_response, error_response})
+
+            # Also send a direct error message to ensure immediate propagation
+            send(pid, {:error, error_message})
           end
         end)
       end
     end
-    
+
     # Return normal termination message, don't raise an exception
     # This is triggered normally when using the wrapper script
     if status == 0 do
@@ -597,25 +620,25 @@ defmodule MCPEx.Transport.Stdio do
       {:stop, {:exit, status}, state}
     end
   end
-  
+
   @impl true
   def handle_info({port, :closed}, state) do
     Logger.warning("Port closed message received from #{inspect(port)}")
-    
+
     # Check if this is our tracked port
     is_our_port = state.port == port
     Logger.debug("Is this our tracked port? #{is_our_port}")
-    
+
     if is_our_port do
       # Check if we have any stderr buffer
       stderr_content = Map.get(state, :stderr_buffer, "")
       if stderr_content && stderr_content != "" do
         Logger.error("Stderr buffer at port closed:\n#{stderr_content}")
-        
+
         # Find linked processes and send error
         if parent = Process.info(self(), :links) do
           error_message = "Command execution failed. Error output:\n#{stderr_content}"
-          
+
           # Send an error to each linked process
           Enum.each(elem(parent, 1), fn pid ->
             if is_pid(pid) and Process.alive?(pid) do
@@ -631,7 +654,7 @@ defmodule MCPEx.Transport.Stdio do
                   }
                 }
               }
-              
+
               # Send as a transport response
               Logger.debug("Sending error response to client: #{inspect(pid)}")
               send(pid, {:transport_response, error_response})
@@ -641,7 +664,7 @@ defmodule MCPEx.Transport.Stdio do
       else
         Logger.warning("No stderr buffer available when port closed")
       end
-      
+
       # Stop the process since the port is closed
       Logger.debug("Stopping process since port is closed")
       {:stop, :normal, state}
@@ -655,7 +678,7 @@ defmodule MCPEx.Transport.Stdio do
   def handle_info(msg, state) do
     Logger.debug("Unhandled message in stdio transport: #{inspect(msg)}")
     Logger.debug("Our tracked port is: #{inspect(state.port)}")
-    
+
     # Check if the port is still alive and get info
     if is_port(state.port) do
       port_info = Port.info(state.port)
@@ -663,7 +686,7 @@ defmodule MCPEx.Transport.Stdio do
     else
       Logger.debug("state.port is not a valid port: #{inspect(state.port)}")
     end
-    
+
     # Handle different message types
     case msg do
       {port, _} when is_port(port) ->
@@ -671,14 +694,14 @@ defmodule MCPEx.Transport.Stdio do
         Logger.warning("Unhandled port message received: #{inspect(msg)}")
         port_info = Port.info(port)
         Logger.debug("Unhandled port info: #{inspect(port_info)}")
-        
+
         # If this port matches our state's port, log that too
         if Map.get(state, :port) == port do
           Logger.warning("Message is from our tracked port")
         end
-        
+
         {:noreply, state}
-        
+
       {:DOWN, ref, :port, port, reason} ->
         # Port monitor message
         Logger.warning("Port monitor :DOWN message received: #{inspect(reason)}")
@@ -686,26 +709,26 @@ defmodule MCPEx.Transport.Stdio do
         # Note: state.port might be nil if the port was already closed or crashed
         our_port = Map.get(state, :port) == port
         our_ref = Map.get(state, :port_ref) == ref
-        
+
         Logger.warning("DOWN message port matches our port: #{our_port}")
         Logger.warning("DOWN message ref matches our ref: #{our_ref}")
         Logger.warning("Our current port is: #{inspect(Map.get(state, :port))}")
-        
+
         # If our current port is nil but the ref matches, this is still our port
         # This can happen if the port died unexpectedly
         if our_port || our_ref || (Map.get(state, :port) == nil && Map.get(state, :port_ref) == ref) do
           # This is for our tracked port, handle as a port exit
           Logger.warning("DOWN message is for our tracked port, handling as port exit")
-          
+
           # Try to get any buffered stderr content
           stderr_content = Map.get(state, :stderr_buffer, "")
           if stderr_content && stderr_content != "" do
             Logger.error("Stderr buffer at port down:\n#{stderr_content}")
-            
+
             # Find linked processes and send error
             if parent = Process.info(self(), :links) do
               error_message = "Command failed. Error output:\n#{stderr_content}"
-              
+
               # Send an error to each linked process
               Enum.each(elem(parent, 1), fn pid ->
                 if is_pid(pid) and Process.alive?(pid) do
@@ -721,7 +744,7 @@ defmodule MCPEx.Transport.Stdio do
                       }
                     }
                   }
-                  
+
                   # Send as a transport response
                   Logger.debug("Sending error response to client: #{inspect(pid)}")
                   send(pid, {:transport_response, error_response})
@@ -729,14 +752,14 @@ defmodule MCPEx.Transport.Stdio do
               end)
             end
           end
-          
+
           # Stop the GenServer with the reason from the DOWN message
           {:stop, {:port_down, reason}, state}
         else
           # Not our port or ref, just continue
           {:noreply, state}
         end
-        
+
       _ ->
         # Some other message type
         {:noreply, state}
@@ -758,7 +781,7 @@ defmodule MCPEx.Transport.Stdio do
         {Enum.reverse(acc), buffer}
     end
   end
-  
+
   # Find a complete message in the buffer
   # This implementation assumes that each message is terminated by a newline
   defp find_message_boundary(buffer) do

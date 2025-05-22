@@ -82,7 +82,13 @@ defmodule MCPEx.Client do
   """
   @spec start_link(options()) :: {:ok, t()} | {:error, term()}
   def start_link(options) do
-    GenServer.start_link(__MODULE__, options)
+    try do
+      GenServer.start_link(__MODULE__, options)
+    catch
+      :exit, reason ->
+        Logger.warning("Client.start_link caught exit: #{inspect(reason)}")
+        {:error, reason}
+    end
   end
 
   @doc """
@@ -96,7 +102,7 @@ defmodule MCPEx.Client do
   def stop(client) do
     GenServer.stop(client)
   end
-  
+
   @impl true
   def terminate(_reason, state) do
     # Clean up by closing the transport connection
@@ -108,7 +114,7 @@ defmodule MCPEx.Client do
           MCPEx.Transport.close(state.transport)
         end
       rescue
-        error -> 
+        error ->
           # Just log the error and continue with termination
           Logger.error("Error during client cleanup: #{inspect(error)}")
       catch
@@ -119,12 +125,12 @@ defmodule MCPEx.Client do
     end
     :ok
   end
-  
+
   @doc """
   Returns the server capabilities negotiated during initialization.
-  
+
   ## Returns
-  
+
   * `{:ok, map()}` - Server capabilities
   * `{:error, reason}` - Failed to get capabilities
   """
@@ -133,25 +139,25 @@ defmodule MCPEx.Client do
     case GenServer.call(client, :get_server_capabilities) do
       # Handle the response from the test server which may be more directly formatted
       {:ok, capabilities} -> {:ok, capabilities}
-      
+
       # Already in the correct format
       capabilities when is_map(capabilities) -> {:ok, capabilities}
-      
+
       # Error case
       {:error, _} = error -> error
-      
+
       # Unexpected format
-      other -> 
+      other ->
         Logger.warning("Unexpected capabilities format: #{inspect(other)}")
         {:error, :invalid_capabilities_format}
     end
   end
-  
+
   @doc """
   Returns information about the connected server.
-  
+
   ## Returns
-  
+
   * `{:ok, map()}` - Server information
   * `{:error, reason}` - Failed to get server information
   """
@@ -160,15 +166,15 @@ defmodule MCPEx.Client do
     case GenServer.call(client, :get_server_info) do
       # Handle the response from the test server which may be more directly formatted
       {:ok, server_info} -> {:ok, server_info}
-      
+
       # Already in the correct format
       server_info when is_map(server_info) -> {:ok, server_info}
-      
+
       # Error case
       {:error, _} = error -> error
-      
+
       # Unexpected format
-      other -> 
+      other ->
         Logger.warning("Unexpected server info format: #{inspect(other)}")
         {:error, :invalid_server_info_format}
     end
@@ -208,7 +214,7 @@ defmodule MCPEx.Client do
   def list_resources(client, cursor \\ nil) do
     GenServer.call(client, {:list_resources, cursor})
   end
-  
+
   @doc """
   Lists available tools from the server.
 
@@ -225,7 +231,7 @@ defmodule MCPEx.Client do
   def list_tools(client, cursor \\ nil) do
     GenServer.call(client, {:list_tools, cursor})
   end
-  
+
   @doc """
   Calls a tool on the server.
 
@@ -311,7 +317,7 @@ defmodule MCPEx.Client do
   def list_resource_templates(client, cursor \\ nil) do
     GenServer.call(client, {:list_resource_templates, cursor})
   end
-  
+
   @doc """
   Lists available prompts from the server.
 
@@ -328,16 +334,16 @@ defmodule MCPEx.Client do
   def list_prompts(client, cursor \\ nil) do
     # Call the server
     response = GenServer.call(client, {:list_prompts, cursor})
-    
+
     # For the test case, handle both formats of response
     case response do
-      {:ok, %{"id" => _, "jsonrpc" => _, "result" => result}} -> 
+      {:ok, %{"id" => _, "jsonrpc" => _, "result" => result}} ->
         {:ok, result}
-      {:ok, %{"error" => error}} -> 
+      {:ok, %{"error" => error}} ->
         {:error, error}
-      {:error, _} = error -> 
+      {:error, _} = error ->
         error
-      other -> 
+      other ->
         other
     end
   end
@@ -349,7 +355,7 @@ defmodule MCPEx.Client do
 
   * `name` - The name of the prompt to get
   * `args` - Optional arguments to apply to the prompt template
-  
+
   ## Returns
 
   * `{:ok, %{description: String.t(), messages: [...]}}` - Successfully fetched prompt with messages
@@ -359,16 +365,16 @@ defmodule MCPEx.Client do
   def get_prompt(client, name, args \\ %{}) do
     # Call the server
     response = GenServer.call(client, {:get_prompt, name, args})
-    
+
     # For the test case, handle both formats of response
     case response do
-      {:ok, %{"id" => _, "jsonrpc" => _, "result" => result}} -> 
+      {:ok, %{"id" => _, "jsonrpc" => _, "result" => result}} ->
         {:ok, result}
-      {:ok, %{"error" => error}} -> 
+      {:ok, %{"error" => error}} ->
         {:error, error}
-      {:error, _} = error -> 
+      {:error, _} = error ->
         error
-      other -> 
+      other ->
         other
     end
   end
@@ -377,14 +383,14 @@ defmodule MCPEx.Client do
 
   @doc """
   Registers a sampling handler for the client.
-  
+
   ## Parameters
-  
+
   * `client` - The client PID
   * `handler` - The handler module or {module, config} tuple
-  
+
   ## Returns
-  
+
   * `:ok` - Handler registered successfully
   * `{:error, reason}` - Failed to register handler
   """
@@ -392,26 +398,26 @@ defmodule MCPEx.Client do
   def register_sampling_handler(client, handler) do
     GenServer.call(client, {:register_sampling_handler, handler})
   end
-  
+
   @impl true
   def init(options) do
     transport_type = Keyword.fetch!(options, :transport)
     capabilities = Keyword.get(options, :capabilities, [])
     client_info = Keyword.get(options, :client_info, %{name: "MCPEx", version: "0.1.0"})
     transport_options = Keyword.get(options, :transport_options, [])
-    
+
     # Get sampling handler if provided
     sampling_handler = Keyword.get(options, :sampling_handler)
-    
+
     # Shell type controls whether to run in user's shell environment
     # and which type of shell to use (interactive, login, plain or none)
     shell_type = Keyword.get(options, :shell_type, :none)
-    
+
     # Get path to the io_wrapper script
     wrapper_path = try do
       # Use OTP application priv directory - the proper way to access non-code files
       wrapper = Application.app_dir(:mcp_ex, "priv/scripts/io_wrapper.sh")
-      
+
       # Check if file exists and is executable
       if File.exists?(wrapper) do
         case File.stat(wrapper) do
@@ -424,7 +430,7 @@ defmodule MCPEx.Client do
               Logger.warning("IO wrapper exists but is not executable: #{wrapper}")
               nil
             end
-          _ -> 
+          _ ->
             Logger.warning("Could not stat IO wrapper: #{wrapper}")
             nil
         end
@@ -433,11 +439,11 @@ defmodule MCPEx.Client do
         nil
       end
     rescue
-      e -> 
+      e ->
         Logger.warning("Error locating io_wrapper.sh: #{inspect(e)}")
         nil
     end
-    
+
     # Create stderr log file and store its path
     stderr_log_path = if wrapper_path do
       path = Path.join(System.tmp_dir(), "mcp_stderr_#{:erlang.system_time()}.log")
@@ -446,7 +452,7 @@ defmodule MCPEx.Client do
     else
       nil
     end
-    
+
     # Handle different transport options
     {transport_to_use, needs_create} =
       case transport_type do
@@ -457,20 +463,20 @@ defmodule MCPEx.Client do
           # Need to create stdio transport with args if provided
           command = Keyword.fetch!(options, :command)
           args = if Keyword.has_key?(options, :args), do: Keyword.get(options, :args), else: []
-          
+
           # Use the wrapper script if available and we're using stdio
           use_wrapper = wrapper_path != nil && stderr_log_path != nil
-          
+
           # Check if we should enhance with shell environment and if CommandUtils is available
           if shell_type != :none && Code.ensure_loaded?(MCPEx.Utils.CommandUtils) do
             # We'll rely on the shell that we're about to use rather than
             # looking up the command path with another shell command
             # This avoids double-wrapping shell commands
             command_with_path = command
-              
+
             # Get the user's shell to execute the command through
             {shell_path, _shell_name} = MCPEx.Utils.CommandUtils.get_user_shell()
-            
+
             # Prepare shell execution based on the requested shell type
             # Also track if we need to add a delay before sending messages
             # Interactive shells need time to initialize
@@ -480,24 +486,24 @@ defmodule MCPEx.Client do
               :plain -> {true, ["-c"], false}
               _ -> {false, nil, false}
             end
-            
+
             # Get any environment variables from options
             env = Keyword.get(options, :env, [])
-            
+
             # We have two approaches:
             # 1. Direct execution through CommandUtils.execute_through_port
             # 2. Shell wrapping approach where we use the shell as the command
-            
+
             if use_shell do
               # For shell wrapping, the command becomes the shell path
               # and the args become the shell args + our command
               full_command = "#{command_with_path} #{Enum.join(args, " ")}"
               Logger.debug("Using #{shell_type} shell (#{shell_path}): #{Enum.join(shell_args, " ")} \"#{full_command}\"")
-              
+
               if use_wrapper do
                 # Use wrapper script around the shell command to capture stderr
                 Logger.debug("Using IO wrapper script: #{wrapper_path}")
-                
+
                 # Build options with wrapper wrapping the shell invocation
                 wrapper_stdio_options = Keyword.merge(
                   [
@@ -507,10 +513,10 @@ defmodule MCPEx.Client do
                     use_shell_env: true,
                     needs_shell_delay: needs_delay,
                     use_wrapper: false # Already using our wrapper
-                  ], 
+                  ],
                   transport_options
                 )
-                
+
                 {wrapper_stdio_options, true}
               else
                 # Standard shell execution without wrapper
@@ -521,10 +527,10 @@ defmodule MCPEx.Client do
                     env: env,
                     use_shell_env: true,
                     needs_shell_delay: needs_delay
-                  ], 
+                  ],
                   transport_options
                 )
-                
+
                 {shell_stdio_options, true}
               end
             else
@@ -532,11 +538,11 @@ defmodule MCPEx.Client do
               enhanced_options = transport_options
                 |> Keyword.put(:command_with_path, command_with_path)
                 |> Keyword.put(:env, env)
-                
+
               if use_wrapper do
                 # Use wrapper script with the direct command
                 Logger.debug("Using IO wrapper script: #{wrapper_path}")
-                
+
                 # Create options with wrapper as command
                 wrapper_stdio_options = Keyword.merge(
                   [
@@ -544,10 +550,10 @@ defmodule MCPEx.Client do
                     args: [command] ++ args,
                     env: enhanced_options[:env] || [] ++ [{"MCP_STDERR_LOG", stderr_log_path}],
                     use_wrapper: false # Already using our wrapper
-                  ], 
+                  ],
                   transport_options
                 )
-                
+
                 {wrapper_stdio_options, true}
               else
                 # Create final options with original command (for fallback) and args
@@ -560,17 +566,17 @@ defmodule MCPEx.Client do
             if use_wrapper do
               # Use wrapper script with standard command
               Logger.debug("Using IO wrapper script: #{wrapper_path}")
-              
+
               wrapper_stdio_options = Keyword.merge(
                 [
                   command: wrapper_path,
                   args: [command] ++ args,
                   env: [{"MCP_STDERR_LOG", stderr_log_path}],
                   use_wrapper: false # Already using our wrapper
-                ], 
+                ],
                 transport_options
               )
-              
+
               {wrapper_stdio_options, true}
             else
               # Standard options without wrapper
@@ -586,40 +592,42 @@ defmodule MCPEx.Client do
           raise "Unsupported transport type: #{inspect(transport_type)}"
       end
 
-    transport_result = 
+    transport_result =
       if needs_create do
         Transport.create(transport_type, transport_to_use)
       else
         {:ok, transport_to_use}
       end
-    
-    with {:ok, transport} <- transport_result do 
+
+    with {:ok, transport} <- transport_result do
       # Register for transport process exit notifications
       Process.monitor(transport)
-      
+
       # Start initialization process
       init_result = initialize_connection(transport, capabilities, client_info)
+      Logger.debug("Initialization result: #{inspect(init_result)}")
       
+      # Process the initialization result
       case init_result do
-        {:ok, server_info} -> 
+        {:ok, server_info} ->
           # Extract the server capabilities and info from the response
-          server_capabilities = Map.get(server_info, :capabilities) || 
-                             Map.get(server_info, "capabilities") || 
+          server_capabilities = Map.get(server_info, :capabilities) ||
+                             Map.get(server_info, "capabilities") ||
                              # Initialize with basic capabilities for tests
                              %{
                                resources: %{subscribe: true},
                                tools: %{},
                                prompts: %{}
                              }
-                             
-          server_info_data = Map.get(server_info, :server_info) || 
-                           Map.get(server_info, "server_info") || 
+
+          server_info_data = Map.get(server_info, :server_info) ||
+                           Map.get(server_info, "server_info") ||
                            # Initialize with basic server info for tests
                            %{
                              name: "TestServer",
                              version: "1.0.0"
                            }
-          
+
           # Create the server state
           {:ok,
            %{
@@ -631,16 +639,30 @@ defmodule MCPEx.Client do
              server_info: server_info_data,
              sampling_handler: sampling_handler || Sampling.default_handler()
            }}
-        
-        {:error, reason} -> 
+
+        {:error, reason} ->
           # Close the transport and stop the process
           try do
             Transport.close(transport)
+            Logger.debug("Transport closed: #{inspect(reason)}")
           catch
             _, _ -> :ok
           end
           
-          {:stop, reason}
+          # IMPORTANT: Log that we're converting this to an error tuple
+          Logger.warning("Client.init is converting {:error, reason} to {:stop, reason}: #{inspect(reason)}")
+          
+          # Create a standardized error format
+          error_message = case reason do
+            %{message: msg} when is_binary(msg) -> msg
+            %{data: %{stderr: stderr}} when is_binary(stderr) -> 
+              "Command error: #{stderr}"
+            error when is_binary(error) -> error
+            other -> "Initialization error: #{inspect(other)}"
+          end
+          
+          Logger.error("Client initialization failed with error: #{error_message}")
+          {:stop, error_message}
       end
     else
       {:error, reason} -> {:stop, reason}
@@ -653,7 +675,7 @@ defmodule MCPEx.Client do
     updated_state = %{state | sampling_handler: handler}
     {:reply, :ok, updated_state}
   end
-  
+
   @impl true
   def handle_call(:get_server_capabilities, _from, state) do
     if Map.has_key?(state, :server_capabilities) do
@@ -662,7 +684,7 @@ defmodule MCPEx.Client do
       {:reply, {:error, :not_initialized}, state}
     end
   end
-  
+
   @impl true
   def handle_call(:get_server_info, _from, state) do
     if Map.has_key?(state, :server_info) do
@@ -705,7 +727,7 @@ defmodule MCPEx.Client do
         end
 
         {:noreply, updated_state}
-      
+
       {:error, reason} ->
         # Immediate failure
         {:reply, {:error, reason}, state}
@@ -729,13 +751,13 @@ defmodule MCPEx.Client do
         }
 
         {:noreply, updated_state}
-      
+
       {:error, reason} ->
         # Immediate failure
         {:reply, {:error, reason}, state}
     end
   end
-  
+
   @impl true
   def handle_call({:list_tools, cursor}, from, state) do
     request_id = state.request_id + 1
@@ -753,19 +775,19 @@ defmodule MCPEx.Client do
         }
 
         {:noreply, updated_state}
-      
+
       {:error, reason} ->
         # Immediate failure
         {:reply, {:error, reason}, state}
     end
   end
-  
+
   @impl true
   def handle_call({:call_tool, name, args}, from, state) do
     request_id = state.request_id + 1
-    
+
     # According to MCP spec 2025-03-26, tool calls use "arguments" not "args"
-    params = %{"name" => name, "arguments" => args} 
+    params = %{"name" => name, "arguments" => args}
     payload = JsonRpc.encode_request(request_id, "tools/call", params)
 
     # No debug logging in normal operation
@@ -781,13 +803,13 @@ defmodule MCPEx.Client do
         }
 
         {:noreply, updated_state}
-      
+
       {:error, reason} ->
         # Immediate failure
         {:reply, {:error, reason}, state}
     end
   end
-  
+
   @impl true
   def handle_call({:list_prompts, cursor}, from, state) do
     request_id = state.request_id + 1
@@ -796,12 +818,12 @@ defmodule MCPEx.Client do
 
     # Direct handling for testing
     case is_pid(state.transport) and Process.info(state.transport)[:registered_name] == nil do
-      true -> 
+      true ->
         # This is a test transport, receive response directly
         try do
           # Direct call to transport's process_request
           case :sys.get_state(state.transport) do
-            %{server: server} -> 
+            %{server: server} ->
               {response, _} = MCPEx.Transport.TestServer.process_message(server, nil, Jason.decode!(payload))
               if Map.has_key?(response, "result") do
                 {:reply, {:ok, response["result"]}, state}
@@ -813,11 +835,11 @@ defmodule MCPEx.Client do
               send_regular_request(state, request_id, payload, from, "prompts/list")
           end
         catch
-          _, _ -> 
+          _, _ ->
             # Proceed with normal channel if the direct approach fails
             send_regular_request(state, request_id, payload, from, "prompts/list")
         end
-        
+
       false ->
         # Regular transport, proceed as normal
         send_regular_request(state, request_id, payload, from, "prompts/list")
@@ -836,12 +858,12 @@ defmodule MCPEx.Client do
 
     # Direct handling for testing
     case is_pid(state.transport) and Process.info(state.transport)[:registered_name] == nil do
-      true -> 
+      true ->
         # This is a test transport, receive response directly
         try do
           # Direct call to transport's process_request
           case :sys.get_state(state.transport) do
-            %{server: server} -> 
+            %{server: server} ->
               {response, _} = MCPEx.Transport.TestServer.process_message(server, nil, Jason.decode!(payload))
               if Map.has_key?(response, "error") do
                 error = response["error"]
@@ -859,11 +881,11 @@ defmodule MCPEx.Client do
               send_regular_request(state, request_id, payload, from, "prompts/get")
           end
         catch
-          _, _ -> 
+          _, _ ->
             # Proceed with normal channel if the direct approach fails
             send_regular_request(state, request_id, payload, from, "prompts/get")
         end
-        
+
       false ->
         # Regular transport, proceed as normal
         send_regular_request(state, request_id, payload, from, "prompts/get")
@@ -886,7 +908,7 @@ defmodule MCPEx.Client do
         }
 
         {:noreply, updated_state}
-      
+
       {:error, reason} ->
         # Immediate failure
         {:reply, {:error, reason}, state}
@@ -900,7 +922,7 @@ defmodule MCPEx.Client do
       :ok ->
         # Store the method with the request for later identification
         request_info = Map.put(%{}, :method, method)
-        
+
         # Update state with pending request
         updated_state = %{
           state
@@ -909,7 +931,7 @@ defmodule MCPEx.Client do
         }
 
         {:noreply, updated_state}
-      
+
       {:error, reason} ->
         # Immediate failure
         {:reply, {:error, reason}, state}
@@ -927,7 +949,7 @@ defmodule MCPEx.Client do
           :ok -> {:ok, state}
           error -> error # Pass through any errors
         end
-        
+
       {:error, error} ->
         # Error response
         response = JsonRpc.encode_error_response(id, error.code, error.message)
@@ -937,7 +959,7 @@ defmodule MCPEx.Client do
         end
     end
   end
-  
+
   # Default handler for unknown methods
   defp handle_method(method, id, _params, state) do
     # Respond with method not found error
@@ -952,27 +974,27 @@ defmodule MCPEx.Client do
   @impl true
   def handle_info({:transport_response, response}, state) do
     # Process the response
-    processed_response = 
+    processed_response =
       case is_binary(response) do
-        true -> 
+        true ->
           # First try standard JSON-RPC decode
           case JsonRpc.decode_message(response) do
             {:ok, decoded} -> decoded
-            _ -> 
+            _ ->
               # Try direct JSON decode next
               case Jason.decode(response) do
                 {:ok, decoded} -> decoded
                 _ -> handle_raw_response(response)
               end
           end
-        false -> 
+        false ->
           # It's already a map, possibly from TestTransport or parsed JSON
           response
       end
-    
+
     # Log the response for debugging
     Logger.debug("Processed transport response: #{inspect(processed_response)}")
-    
+
     # Check if this is a JSON-RPC method request
     case processed_response do
       %{"jsonrpc" => "2.0", "method" => method, "id" => id, "params" => params} ->
@@ -981,19 +1003,19 @@ defmodule MCPEx.Client do
           {:ok, updated_state} -> {:noreply, updated_state}
           {:error, _reason} -> {:noreply, state}  # Keep state on error
         end
-        
+
       # Continue with regular response handling
       _ ->
         # Handle regular response processing
         handle_response(processed_response, state)
     end
   end
-  
+
   # Enhanced transport process termination handler with stderr capture
   @impl true
   def handle_info({:DOWN, _ref, :process, transport_pid, reason}, %{transport: transport_pid} = state) do
     # Try to get any captured stderr output from the transport
-    stderr_content = 
+    stderr_content =
       if Code.ensure_loaded?(MCPEx.Transport.Stdio) do
         try do
           MCPEx.Transport.Stdio.get_stderr_buffer(transport_pid)
@@ -1003,39 +1025,39 @@ defmodule MCPEx.Client do
       else
         nil
       end
-    
+
     Logger.warning("Transport process terminated with reason: #{inspect(reason)}, stderr captured: #{stderr_content != nil}")
-    
+
     # Determine if this happened during initialization (all pending requests)
     pending_request_ids = Map.keys(state.pending_requests)
-    
+
     if length(pending_request_ids) > 0 do
       # Reply to all pending requests with the error
       for {_id, request_info} <- state.pending_requests do
         # Extract from field depending on format
-        from = 
+        from =
           cond do
-            is_map(request_info) && Map.has_key?(request_info, :from) -> 
+            is_map(request_info) && Map.has_key?(request_info, :from) ->
               Map.get(request_info, :from)
-            is_map(request_info) && Map.has_key?(request_info, "from") -> 
+            is_map(request_info) && Map.has_key?(request_info, "from") ->
               Map.get(request_info, "from")
-            is_pid(request_info) -> 
+            is_pid(request_info) ->
               request_info
             is_tuple(request_info) && tuple_size(request_info) >= 1 && is_pid(elem(request_info, 0)) ->
               request_info
             true -> nil
           end
-          
+
         if from != nil do
           # Format a more descriptive error message based on the reason and stderr
-          error_message = 
+          error_message =
             case reason do
               {:exit, exit_code} when is_integer(exit_code) ->
                 if stderr_content && String.trim(stderr_content) != "" do
                   # Include captured stderr in error message
                   """
                   MCP server process exited with code #{exit_code}.
-                  
+
                   Error output:
                   #{stderr_content}
                   """
@@ -1051,18 +1073,18 @@ defmodule MCPEx.Client do
               other ->
                 "MCP server process terminated unexpectedly: #{inspect(other)}"
             end
-          
+
           # Reply with the enhanced error
           safe_reply(from, {:error, error_message})
         end
       end
     end
-    
+
     # Clean up and terminate
     {:stop, {:transport_terminated, reason}, %{state | pending_requests: %{}}}
   end
-  
-  
+
+
   # Handle regular JSON-RPC responses
   defp handle_response(processed_response, state) do
     # Handle complete JSON-RPC responses for TestServer
@@ -1071,65 +1093,65 @@ defmodule MCPEx.Client do
       %{"id" => id, "jsonrpc" => "2.0", "result" => result} ->
         if Map.has_key?(state.pending_requests, id) do
           request_info = state.pending_requests[id]
-          
+
           # For debugging - show the request_info structure
           Logger.debug("Processing response for ID #{id} with request_info: #{inspect(request_info)}")
-          
+
           # Extract from and method depending on the format
-          {from, method} = 
+          {from, method} =
             case request_info do
               # Maps with both :from and :method keys (our new format)
-              %{from: actual_from, method: actual_method} -> 
+              %{from: actual_from, method: actual_method} ->
                 {actual_from, actual_method}
-              
+
               # Maps with string keys
-              %{"from" => actual_from, "method" => actual_method} -> 
+              %{"from" => actual_from, "method" => actual_method} ->
                 {actual_from, actual_method}
-              
+
               # Maps with only from key
-              %{from: actual_from} -> 
+              %{from: actual_from} ->
                 {actual_from, nil}
-              
-              %{"from" => actual_from} -> 
+
+              %{"from" => actual_from} ->
                 {actual_from, nil}
-              
+
               # Legacy direct tuple format for standard GenServer.call
-              {pid, _} = direct_tuple when is_pid(pid) -> 
+              {pid, _} = direct_tuple when is_pid(pid) ->
                 {direct_tuple, nil}
-              
+
               # Legacy formats
-              pid when is_pid(pid) -> 
+              pid when is_pid(pid) ->
                 {pid, nil}
-              
+
               # Unknown format - log and use as-is
               other ->
                 Logger.warning("Unknown request_info format: #{inspect(other)}")
                 {other, nil}
             end
-          
+
           Logger.debug("Extracted from: #{inspect(from)}, method: #{inspect(method)}")
-          
+
           # Send the reply based on method
           case method do
-            "prompts/list" -> 
+            "prompts/list" ->
               safe_reply(from, {:ok, result})
-            
-            "prompts/get" -> 
+
+            "prompts/get" ->
               safe_reply(from, {:ok, result})
-            
+
             "ping" ->
               Logger.debug("Sending ping response to caller")
               safe_reply(from, {:ok, result})
-            
+
             nil ->
               # Method not available, just send the result
               safe_reply(from, {:ok, result})
-            
+
             _ ->
               # Any other method
               safe_reply(from, {:ok, result})
           end
-          
+
           # Update state to remove the processed request
           updated_state = %{state | pending_requests: Map.delete(state.pending_requests, id)}
           {:noreply, updated_state}
@@ -1137,65 +1159,65 @@ defmodule MCPEx.Client do
           # Unexpected response ID
           {:noreply, state}
         end
-      
+
       # Handle complete JSON-RPC responses with error
       %{"id" => id, "jsonrpc" => "2.0", "error" => error} ->
         if Map.has_key?(state.pending_requests, id) do
           request_info = state.pending_requests[id]
-          
+
           # For debugging
           Logger.debug("Processing error response for ID #{id} with request_info: #{inspect(request_info)}")
-          
+
           # Extract from and method using the same pattern as for success responses
-          {from, method} = 
+          {from, method} =
             case request_info do
               # Maps with both :from and :method keys (our new format)
-              %{from: actual_from, method: actual_method} -> 
+              %{from: actual_from, method: actual_method} ->
                 {actual_from, actual_method}
-              
+
               # Maps with string keys
-              %{"from" => actual_from, "method" => actual_method} -> 
+              %{"from" => actual_from, "method" => actual_method} ->
                 {actual_from, actual_method}
-              
+
               # Maps with only from key
-              %{from: actual_from} -> 
+              %{from: actual_from} ->
                 {actual_from, nil}
-              
-              %{"from" => actual_from} -> 
+
+              %{"from" => actual_from} ->
                 {actual_from, nil}
-              
+
               # Legacy direct tuple format for standard GenServer.call
-              {pid, _} = direct_tuple when is_pid(pid) -> 
+              {pid, _} = direct_tuple when is_pid(pid) ->
                 {direct_tuple, nil}
-              
+
               # Legacy formats
-              pid when is_pid(pid) -> 
+              pid when is_pid(pid) ->
                 {pid, nil}
-              
+
               # Unknown format - log and use as-is
               other ->
                 Logger.warning("Unknown request_info format: #{inspect(other)}")
                 {other, nil}
             end
-          
+
           Logger.debug("Extracted from: #{inspect(from)}, method: #{inspect(method)}")
-          
+
           # Send the error based on method
           case method do
             "prompts/get" ->
               # For prompts/get, we need special handling for the non-existent prompt test
               Logger.debug("Sending prompts/get error to caller")
               safe_reply(from, {:error, error})
-            
+
             "ping" ->
               Logger.debug("Sending ping error to caller")
               safe_reply(from, {:error, error})
-            
+
             _ ->
               # Any other method or nil
               safe_reply(from, {:error, error})
           end
-          
+
           # Update state to remove the processed request
           updated_state = %{state | pending_requests: Map.delete(state.pending_requests, id)}
           {:noreply, updated_state}
@@ -1203,7 +1225,7 @@ defmodule MCPEx.Client do
           # Unexpected response ID
           {:noreply, state}
         end
-      
+
       # Handle structured responses with atom keys
       %{id: id, result: result} ->
         # Handle successful response
@@ -1244,32 +1266,32 @@ defmodule MCPEx.Client do
         # Broadcast to all subscribers
         Process.send_after(self(), :resources_list_changed, 0)
         {:noreply, state}
-        
+
       # Support for string-keyed maps (for TestTransport)
       %{"id" => id, "result" => result} ->
         if Map.has_key?(state.pending_requests, id) do
           # Return the original result for specific endpoints, otherwise convert to atoms
           request_info = state.pending_requests[id]
-          
+
           # Handle different request_info formats for proper reply
           {from, method} = cond do
-            is_map(request_info) && Map.has_key?(request_info, :from) -> 
+            is_map(request_info) && Map.has_key?(request_info, :from) ->
               {Map.get(request_info, :from), Map.get(request_info, :method)}
-            is_map(request_info) && Map.has_key?(request_info, "from") -> 
+            is_map(request_info) && Map.has_key?(request_info, "from") ->
               {Map.get(request_info, "from"), Map.get(request_info, "method")}
-            is_map(request_info) -> 
+            is_map(request_info) ->
               {request_info, nil}
-            is_tuple(request_info) -> 
+            is_tuple(request_info) ->
               # This is the format for direct GenServer.call storage: {pid, tag}
               {elem(request_info, 0), nil}
-            true -> 
+            true ->
               {request_info, nil}
           end
-          
+
           case method do
-            "prompts/list" -> 
+            "prompts/list" ->
               safe_reply(from, {:ok, result})
-            "prompts/get" -> 
+            "prompts/get" ->
               safe_reply(from, {:ok, result})
             _ ->
               safe_reply(from, {:ok, string_keys_to_atoms(result)})
@@ -1280,26 +1302,26 @@ defmodule MCPEx.Client do
           # Unexpected response ID
           {:noreply, state}
         end
-        
+
       %{"id" => id, "error" => error} ->
         if Map.has_key?(state.pending_requests, id) do
           request_info = state.pending_requests[id]
-          
+
           # Handle different request_info formats for proper reply
           {from, method} = cond do
-            is_map(request_info) && Map.has_key?(request_info, :from) -> 
+            is_map(request_info) && Map.has_key?(request_info, :from) ->
               {Map.get(request_info, :from), Map.get(request_info, :method)}
-            is_map(request_info) && Map.has_key?(request_info, "from") -> 
+            is_map(request_info) && Map.has_key?(request_info, "from") ->
               {Map.get(request_info, "from"), Map.get(request_info, "method")}
-            is_map(request_info) -> 
+            is_map(request_info) ->
               {request_info, nil}
-            is_tuple(request_info) -> 
+            is_tuple(request_info) ->
               # This is the format for direct GenServer.call storage: {pid, tag}
               {elem(request_info, 0), nil}
-            true -> 
+            true ->
               {request_info, nil}
           end
-          
+
           case method do
             "prompts/get" ->
               # Keep original error format for get_prompt error handling test
@@ -1307,14 +1329,14 @@ defmodule MCPEx.Client do
             _ ->
               safe_reply(from, {:error, string_keys_to_atoms(error)})
           end
-          
+
           state = %{state | pending_requests: Map.delete(state.pending_requests, id)}
           {:noreply, state}
         else
           # Unexpected response ID
           {:noreply, state}
         end
-        
+
       %{"method" => "notifications/resources/updated", "params" => params} ->
         # Handle resource update notification with string keys
         # Notify subscribers
@@ -1325,7 +1347,7 @@ defmodule MCPEx.Client do
           end)
         end
         {:noreply, state}
-        
+
       %{"method" => "notifications/resources/list_changed"} ->
         # Handle resource list change notification
         # Broadcast to all subscribers
@@ -1337,11 +1359,11 @@ defmodule MCPEx.Client do
         {:noreply, state}
     end
   end
-  
+
   # Handle responses that couldn't be decoded with JsonRpc
   defp handle_raw_response(response) do
     case Jason.decode(response) do
-      {:ok, decoded} -> 
+      {:ok, decoded} ->
         # Try to convert to atom keys
         try do
           Enum.reduce(decoded, %{}, fn {k, v}, acc ->
@@ -1350,8 +1372,8 @@ defmodule MCPEx.Client do
         rescue
           _ -> decoded  # Return as-is if conversion fails
         end
-        
-      {:error, _} -> 
+
+      {:error, _} ->
         %{}  # Return empty map for unparseable responses
     end
   end
@@ -1363,17 +1385,17 @@ defmodule MCPEx.Client do
     request_id = 1
     protocol_version = MCPEx.Protocol.Capabilities.protocol_version()
     capabilities_map = MCPEx.Protocol.Capabilities.build_client_capabilities(client_capabilities)
-    
+
     params = %{
       "protocolVersion" => protocol_version,
       "capabilities" => capabilities_map,
       "clientInfo" => client_info
     }
-    
+
     payload = MCPEx.Protocol.JsonRpc.encode_request(request_id, "initialize", params)
-    
+
     # Check if this transport needs a shell initialization delay
-    needs_shell_delay = 
+    needs_shell_delay =
       case transport do
         pid when is_pid(pid) ->
           case Process.info(pid, :dictionary) do
@@ -1384,18 +1406,18 @@ defmodule MCPEx.Client do
           end
         _ -> false
       end
-      
+
     # Add a short delay for interactive shells to fully initialize
     if needs_shell_delay do
       Logger.debug("Adding delay for shell initialization (500ms)")
       Process.sleep(500)
     end
-    
+
     # Log debug info for initialization
     Logger.debug("Sending initialize request: #{payload}")
-    
+
     # Special case for TestTransport (first try direct request to avoid GenServer calls)
-    is_test = 
+    is_test =
       case transport do
         pid when is_pid(pid) ->
           # If this is a test transport, its name might start with "MCPEx.Transport.Test"
@@ -1404,9 +1426,9 @@ defmodule MCPEx.Client do
             {:registered_name, name} when is_atom(name) ->
               name = Atom.to_string(name)
               String.starts_with?(name, "MCPEx.Transport.Test")
-            
+
             # The process is not registered - might be our TestTransport
-            _ -> 
+            _ ->
               # Try to lookup the module name using a safe method
               try do
                 case :sys.get_state(pid) do
@@ -1419,14 +1441,14 @@ defmodule MCPEx.Client do
                 _ -> false
               end
           end
-        
+
         _ -> false
       end
-    
+
     if is_test do
       # For test mode, handle the direct communication with TestServer
       Logger.debug("Detected test transport, will handle initialization directly")
-      
+
       # Prepare a simple response with the basic capabilities
       response = %{
         "capabilities" => %{
@@ -1435,11 +1457,11 @@ defmodule MCPEx.Client do
           "prompts" => true
         },
         "serverInfo" => %{
-          "name" => "TestServer", 
+          "name" => "TestServer",
           "version" => "1.0.0"
         }
       }
-      
+
       # Process the response directly
       {:ok, %{
         capabilities: process_capabilities(response["capabilities"]),
@@ -1451,55 +1473,55 @@ defmodule MCPEx.Client do
       case send_request(transport, payload) do
         :ok ->
           Logger.debug("Initialize request sent successfully, waiting for response...")
-          
+
           # Set up a reference to monitor the transport process
           transport_ref = Process.monitor(transport)
-          
+
           # Wait for response or process exit
           receive do
             {:transport_response, response} ->
               # Demonitor the transport process
               Process.demonitor(transport_ref, [:flush])
-              
+
               Logger.debug("Received initialize response: #{inspect(response)}")
-            
+
               # Ensure response is properly formatted
               processed_response = case response do
                 response when is_binary(response) ->
                   # Parse the JSON response
                   Jason.decode!(response)
-                  
+
                 # Handle properly formatted JSON-RPC responses with result field
                 %{"jsonrpc" => "2.0", "id" => _, "result" => result} ->
                   # Extract just the result for consistency
                   %{"result" => result}
-                  
+
                 # Handle properly formatted JSON-RPC response with error field
                 %{"jsonrpc" => "2.0", "id" => _, "error" => error} ->
-                  # Extract just the error for consistency  
+                  # Extract just the error for consistency
                   %{"error" => error}
-                  
+
                 # Already a map with result structure
                 response when is_map(response) ->
                   # Keep as is if it already has the correct structure
                   response
-                  
+
                 # Special case for test responses in tuple format
                 {:ok, result} when is_map(result) ->
                   # Handle response from test servers
                   %{"result" => result}
-                  
+
                 # Special case for error responses in tuple format
                 {:error, error} ->
                   # Handle error response from test servers
                   %{"error" => error}
-                  
+
                 # Handle any other format that might come from tests
-                response -> 
+                response ->
                   # Wrap in a map if it's not already a map
                   if is_map(response), do: response, else: %{"result" => response}
               end
-              
+
               # Check for errors
               cond do
                 # Handle error response
@@ -1507,57 +1529,57 @@ defmodule MCPEx.Client do
                   error_data = Map.get(processed_response, "error")
                   Logger.error("Initialize error: #{inspect(error_data)}")
                   {:error, string_keys_to_atoms(error_data)}
-                  
+
                 # Handle regular JSON-RPC response
                 is_map(processed_response) && Map.has_key?(processed_response, "result") ->
                   # Get the result field
                   result = Map.get(processed_response, "result")
-                  
+
                   # Send initialized notification
                   initialized_payload = MCPEx.Protocol.JsonRpc.encode_notification("notifications/initialized", %{})
                   Logger.debug("Sending initialized notification: #{initialized_payload}")
                   send_request(transport, initialized_payload)
-                  
+
                   # Process server info - handle both string and atom keys
-                  capabilities_data = Map.get(result, "capabilities") || 
+                  capabilities_data = Map.get(result, "capabilities") ||
                                      Map.get(result, :capabilities) || %{}
-                                     
-                  server_info_data = Map.get(result, "serverInfo") || 
-                                    Map.get(result, :serverInfo) || 
+
+                  server_info_data = Map.get(result, "serverInfo") ||
+                                    Map.get(result, :serverInfo) ||
                                     %{"name" => "Unknown", "version" => "Unknown"}
-                  
+
                   Logger.debug("Received capabilities: #{inspect(capabilities_data)}")
                   Logger.debug("Received server info: #{inspect(server_info_data)}")
-                  
+
                   # Convert capabilities to proper structure with atom keys
                   processed_capabilities = process_capabilities(capabilities_data)
                   processed_server_info = string_keys_to_atoms(server_info_data)
-                  
+
                   # Return the processed data
                   {:ok, %{
                     capabilities: processed_capabilities,
                     server_info: processed_server_info
                   }}
-                  
+
                 # Special case for tests where response might be a direct result
                 is_map(processed_response) ->
                   # Send initialized notification
                   initialized_payload = MCPEx.Protocol.JsonRpc.encode_notification("notifications/initialized", %{})
                   Logger.debug("Sending initialized notification: #{initialized_payload}")
                   send_request(transport, initialized_payload)
-                  
+
                   # Treat the whole response as the result if no "result" field
-                  capabilities_data = Map.get(processed_response, "capabilities") || 
+                  capabilities_data = Map.get(processed_response, "capabilities") ||
                                       Map.get(processed_response, :capabilities) || %{}
-                                      
-                  server_info_data = Map.get(processed_response, "serverInfo") || 
-                                    Map.get(processed_response, :serverInfo) || 
+
+                  server_info_data = Map.get(processed_response, "serverInfo") ||
+                                    Map.get(processed_response, :serverInfo) ||
                                     %{"name" => "Unknown", "version" => "Unknown"}
-                  
+
                   # Convert capabilities to proper structure with atom keys
                   processed_capabilities = process_capabilities(capabilities_data)
                   processed_server_info = string_keys_to_atoms(server_info_data)
-                  
+
                   # Signal the transport to stop buffering stderr since initialization is complete
                   if Code.ensure_loaded?(MCPEx.Transport.Stdio) do
                     try do
@@ -1566,23 +1588,23 @@ defmodule MCPEx.Client do
                       _, _ -> :ok  # Ignore errors
                     end
                   end
-                  
+
                   # Return the processed data
                   {:ok, %{
                     capabilities: processed_capabilities,
                     server_info: processed_server_info
                   }}
-                  
+
                 # Catch-all for unexpected formats
                 true ->
                   Logger.error("Unexpected initialize response format: #{inspect(processed_response)}")
                   {:error, "Invalid initialize response format"}
               end
-              
-            # NEW: Handle transport process exit during initialization  
+
+            # NEW: Handle transport process exit during initialization
             {:DOWN, ^transport_ref, :process, _pid, reason} ->
               # Try to get any stderr output collected during initialization
-              stderr_content = 
+              stderr_content =
                 if Code.ensure_loaded?(MCPEx.Transport.Stdio) do
                   try do
                     MCPEx.Transport.Stdio.get_stderr_buffer(transport)
@@ -1592,15 +1614,15 @@ defmodule MCPEx.Client do
                 else
                   nil
                 end
-              
+
               # Create a descriptive error message based on the reason and stderr
-              error_message = 
+              error_message =
                 case reason do
                   {:exit, exit_code} when is_integer(exit_code) ->
                     if stderr_content && String.trim(stderr_content) != "" do
                       """
                       MCP server process exited with code #{exit_code} during initialization.
-                      
+
                       Error output:
                       #{stderr_content}
                       """
@@ -1613,34 +1635,34 @@ defmodule MCPEx.Client do
                         _ -> "MCP server process exited with code #{exit_code} during initialization. Check server logs for details."
                       end
                     end
-                    
+
                   other ->
                     "MCP server process terminated unexpectedly during initialization: #{inspect(other)}"
                 end
-              
+
               Logger.error(error_message)
               {:error, error_message}
-              
+
           after 30000 -> # Extended timeout for npx initialization
             # Demonitor the transport process
             Process.demonitor(transport_ref, [:flush])
-            
+
             Logger.error("Initialize timeout after 30 seconds")
             {:error, "Initialize timeout"}
           end
-        
+
         {:error, reason} ->
           Logger.error("Error sending initialize request: #{inspect(reason)}")
           {:error, reason}
       end
     end
   end
-  
+
   # Process capabilities to ensure proper atom key format with MCP structure
   defp process_capabilities(capabilities) do
     # Start with empty map
     base = %{}
-    
+
     # Process resources capability
     base = case Map.get(capabilities, "resources") || Map.get(capabilities, :resources) do
       nil -> base
@@ -1648,7 +1670,7 @@ defmodule MCPEx.Client do
         # Extract subscribe flag
         subscribe = Map.get(resources_data, "subscribe") || Map.get(resources_data, :subscribe) || false
         list_changed = Map.get(resources_data, "listChanged") || Map.get(resources_data, :listChanged) || false
-        
+
         Map.put(base, :resources, %{
           subscribe: subscribe,
           list_changed: list_changed
@@ -1656,60 +1678,60 @@ defmodule MCPEx.Client do
       true -> Map.put(base, :resources, %{})
       _ -> base
     end
-    
+
     # Process tools capability
     base = case Map.get(capabilities, "tools") || Map.get(capabilities, :tools) do
       nil -> base
       tools_data when is_map(tools_data) ->
         # Extract any tool-specific capabilities
         list_changed = Map.get(tools_data, "listChanged") || Map.get(tools_data, :listChanged) || false
-        
+
         Map.put(base, :tools, %{
           list_changed: list_changed
         })
       true -> Map.put(base, :tools, %{})
       _ -> base
     end
-    
+
     # Process prompts capability
     base = case Map.get(capabilities, "prompts") || Map.get(capabilities, :prompts) do
       nil -> base
       prompts_data when is_map(prompts_data) ->
         # Extract any prompt-specific capabilities
         list_changed = Map.get(prompts_data, "listChanged") || Map.get(prompts_data, :listChanged) || false
-        
+
         Map.put(base, :prompts, %{
           list_changed: list_changed
         })
       true -> Map.put(base, :prompts, %{})
       _ -> base
     end
-    
+
     # Process sampling capability
     base = if Map.has_key?(capabilities, "sampling") || Map.has_key?(capabilities, :sampling) do
       Map.put(base, :sampling, %{})
     else
       base
     end
-    
+
     # Process roots capability
     base = if Map.has_key?(capabilities, "roots") || Map.has_key?(capabilities, :roots) do
       Map.put(base, :roots, %{})
     else
       base
     end
-    
+
     base
   end
-  
+
   # Helper function to convert string keys to atoms recursively
   defp string_keys_to_atoms(map) when is_map(map) do
-    Map.new(map, fn {k, v} -> 
+    Map.new(map, fn {k, v} ->
       atom_key = if is_binary(k), do: String.to_atom(k), else: k
-      {atom_key, string_keys_to_atoms(v)} 
+      {atom_key, string_keys_to_atoms(v)}
     end)
   end
-  
+
   # Handle non-map values
   defp string_keys_to_atoms(value), do: value
 
@@ -1718,36 +1740,36 @@ defmodule MCPEx.Client do
   defp safe_reply(from, reply) do
     try do
       Logger.debug("Safe reply called with from: #{inspect(from)}")
-      
+
       cond do
         is_pid(from) ->
           # This is our custom format with just a pid
           Logger.debug("Sending direct reply to pid")
           send(from, {:reply, reply})
-          
+
         # Standard GenServer.call format {pid, tag} with direct reference
         is_tuple(from) && tuple_size(from) == 2 && is_pid(elem(from, 0)) && is_reference(elem(from, 1)) ->
           Logger.debug("Using GenServer.reply with direct reference")
           GenServer.reply(from, reply)
-          
+
         # Special case for the complex tuple format we're seeing in integration tests
         is_tuple(from) && tuple_size(from) == 2 && is_pid(elem(from, 0)) && is_list(elem(from, 1)) ->
           # This has the structure {pid, [:alias | ref]} that we're seeing in integration tests
           Logger.debug("Using special case for complex tuple format")
           # Extract just the pid and send a direct message
           pid = elem(from, 0)
-          
+
           # First try GenServer.reply
           Logger.debug("Trying GenServer.reply with complex tuple")
           try do
             GenServer.reply(from, reply)
           rescue
-            _ -> 
+            _ ->
               # If that fails, send direct message to the pid
               Logger.debug("Falling back to direct message to pid")
               send(pid, {:reply, reply})
           end
-          
+
         true ->
           # Unknown format, log and try a direct reply if we have a pid
           Logger.warning("UNKNOWN FORMAT for from: #{inspect(from)}")
@@ -1759,10 +1781,10 @@ defmodule MCPEx.Client do
           end
       end
     rescue
-      e -> 
+      e ->
         # Log error but don't crash
         Logger.error("Error replying to client: #{inspect(e)}")
-        
+
         # Try to extract a pid if possible and send directly to it
         if is_tuple(from) && tuple_size(from) >= 1 && is_pid(elem(from, 0)) do
           pid = elem(from, 0)
@@ -1770,10 +1792,10 @@ defmodule MCPEx.Client do
           send(pid, {:reply, reply})
         end
     catch
-      kind, reason -> 
+      kind, reason ->
         # Log error and try direct message as last resort
         Logger.error("Caught error while replying: #{inspect(kind)}, #{inspect(reason)}")
-        
+
         # Try to extract a pid if possible and send directly to it
         if is_tuple(from) && tuple_size(from) >= 1 && is_pid(elem(from, 0)) do
           pid = elem(from, 0)
