@@ -28,7 +28,17 @@ defmodule MCPEx.Transport.Stdio do
   """
   @spec start_link(keyword()) :: {:ok, pid()} | {:error, term()}
   def start_link(options) do
-    GenServer.start_link(__MODULE__, options)
+    # Use GenServer.start (not start_link) to avoid EXIT signals on init failure
+    case GenServer.start(__MODULE__, options) do
+      {:ok, pid} -> 
+        # Success - now link to the process
+        Process.link(pid)
+        {:ok, pid}
+      
+      {:error, reason} -> 
+        # Init failure - return error without linking
+        {:error, reason}
+    end
   end
 
   @doc """
@@ -77,7 +87,14 @@ defmodule MCPEx.Transport.Stdio do
     # Log debug info
     Logger.debug("Stdio transport starting with command: #{command}")
     Logger.debug("Args: #{inspect(args)}")
+    Logger.debug("cd: #{inspect(cd)}")
+    Logger.debug("env: #{inspect(env)}")
 
+    # Convert environment variables to charlists for Port.open
+    env_charlists = Enum.map(env, fn {key, value} ->
+      {String.to_charlist(key), String.to_charlist(value)}
+    end)
+    
     # Basic port options that apply in all cases
     port_options = [
       :binary,
@@ -85,7 +102,7 @@ defmodule MCPEx.Transport.Stdio do
       :hide,
       :use_stdio,
       {:cd, cd},
-      {:env, env}
+      {:env, env_charlists}
     ]
 
     # Initialize with buffer and stderr buffering enabled
